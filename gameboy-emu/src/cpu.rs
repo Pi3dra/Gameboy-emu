@@ -8,13 +8,18 @@ pub enum Binop{
 #[derive(Copy,Clone)]
 pub enum Unop{
     INC, DEC, PUSH
-    
 }
 
 #[derive(Copy,Clone)]
 pub enum Op {
     Binop(Binop, Operand, Operand),
     Unop(Unop, Operand),
+}
+
+// TODO: Use this for Opcodes
+pub enum FuncDescriptor {
+    Binop( fn(&mut CPU, Operand, Operand) , Binop, Operand, Operand),
+    Unop( fn(&mut CPU, Operand) , Unop, Operand)
 }
 
 
@@ -24,86 +29,78 @@ pub enum Reg16 {AF, BC, DE, HL, SP, PC}
 pub enum Reg8 { A, F, B, C, D, E , H, L}
 
 #[derive(Copy,Clone)]
+pub enum MemAdress{
+    HLInc,
+    HLDec,
+    AddrR8(Reg8),
+    AddrR16(Reg16),
+    Addr8(u8),
+    Addr16(u16),
+}
+
+#[derive(Copy,Clone)]
 pub enum Operand {
     Reg8(Reg8),
     Reg16(Reg16),
+    MemAdress(MemAdress), // None == HL , Some(true) == HL+ , Some(false) == HL-
     Imm8,
     Imm16,
-    Value8(u8),
-    Value16(u16),
-    Nil,
 }
 
-impl Operand{
-    fn as_reg8(&self) -> Reg8 {
-        if let Operand::Reg8(value) = self{
-            *value
-        } else {
-            panic!("Not a Reg8");
-        }
-    }
-
-    fn as_reg16(&self) -> Reg16 {
-        if let Operand::Reg16(value) = self{
-            *value
-        } else {
-            panic!("Not a Reg16");
-        }
-        
-    }
-
-    fn as_value8(&self) -> u8 {
-        if let Operand::Value8(value) = self{
-            *value
-        } else {
-            panic!("Not a u8");
-        }
-        
-    }
-
-    fn as_value16(&self) -> u16 {
-        if let Operand::Value16(value) = self{
-            *value
-        } else {
-            panic!("Not a u8");
-        }
-        
-    }
-
-} 
-
+// ================================== CPU =============================
 
 pub struct CPU{
     registers : Registers,
-    bus : MemoryBus,
-    clock : u32
+    bus : Memory,
+    clock : u16,
+    pc : u16,
 }
 
 impl CPU {
-     
 
-    pub fn ld_r_r_u8(&mut self, reg_from : Operand, reg_to : Operand){
-        let from = self.registers.get_u8register(reg_from.as_reg8());
-        self.registers.set_u8register(reg_to.as_reg8(), from);
+    fn update_pc_and_clock(&mut self, pc_increment : u16, clock_increment : u16){
+        self.pc += pc_increment;
+        self.clock += clock_increment;
+    }
+    
+    // Load instructions
+    
+    fn ld_value_u8(&mut self, reg: Reg8, value : u8){
+        self.registers.set_u8register(reg, value);
     }   
 
-    pub fn ld_imm_u8(&mut self, reg_to : Operand, value : Operand){
-        self.registers.set_u8register(reg_to.as_reg8(),value.as_value8())
-    }
+    fn ld_u8(&mut self, operation: Op) {
+        match operation {
+            // TODO: make function get_value from operand 
+            Op::Binop(Binop::LD, operand1, operand2) => match (operand1, operand2) {
+                (Operand::Reg8(src), Operand::Reg8(dst)) => {
+                    let value = self.registers.get_u8register(src);
+                    self.ld_value_u8(src, value);
+                }
+                (Operand::Reg8(src), Operand::Imm8) => {
+                    let value : u8 =  self.bus.read(8*(self.pc + 1));
+                    self.ld_value_u8(src, value);
+                }
+                (Operand::Reg8(src), Operand::MemAdress(test)) => {
+                    let value : u8 =  self.bus.read(8*(self.pc + 1));
+                    self.ld_value_u8(src, value);
+                }
 
-        pub fn sub_to_register(&mut self, reg_to : Operand , value : Operand){
-        match value{
-            Operand::Reg8(register) => self.sub_value_reg8(reg_to, self.registers.get_u8register(register), false, true),
-            Operand::Value8(value) => self.sub_value_reg8(reg_to, value, true, false),
-            _ => panic!("todo"),
-        }
-    }
 
+                _ => println!("todo"),
+            },
+            _ => panic!("not a load"),
+    }
+}
+    
+      
+    // 8 bit arithmetic
     
     fn add_value_reg8(&mut self, register : Reg8, to_add : u8, increment : bool, use_carry : bool){
 
         let register_value : u8 = self.registers.get_u8register(register);
 
+        let to_add = if increment {1} else {to_add};
         let (mut result, mut overflowed) = register_value.overflowing_add(to_add);
 
         //ADC implementation
@@ -138,10 +135,10 @@ impl CPU {
             overflowed = overflowed | overflowed2;
         }
 
-
         self.registers.set_u8register(register,result);
+        
         self.registers.set_flag(ZERO, result == 0);
-        self.registers.set_flag(SUBSTRACTION, false);
+        self.registers.set_flag(SUBSTRACTION, true);
         let half_carry = ((register_value & 0xF) + (to_sub & 0xF)) > 0xF;
         self.registers.set_flag(HALFCARRY, half_carry);
 
@@ -153,22 +150,6 @@ impl CPU {
         match value {
             Operand::Imm8 => panic!("Implement"),
             Operand::Reg8(value) =>  self.and_register(reg1, self.registers.get_u8register(value)),
-            _ => panic!("this should not be happening"),
-        }
-    }
-
-    pub fn or(&mut self, reg1 : Operand, value: Operand){
-        match value {
-            Operand::Imm8 => panic!("Implement"),
-            Operand::Reg8(value) =>  self.or_register(reg1, self.registers.get_u8register(value)),
-            _ => panic!("this should not be happening"),
-        }
-    }
-
-    pub fn xor(&mut self, reg1 : Operand, value: Operand){
-        match value {
-            Operand::Imm8 => panic!("Implement"),
-            Operand::Reg8(value) =>  self.xor_register(reg1, self.registers.get_u8register(value)),
             _ => panic!("this should not be happening"),
         }
     }
@@ -205,7 +186,23 @@ impl CPU {
         self.registers.set_flag(HALFCARRY, false);
         self.registers.set_flag(CARRY, false); 
     }
-    
+
+    fn cp(&mut self, reg_to : Operand , to_sub : u8){
+
+        let register : Reg8 = reg_to.as_reg8();
+        let register_value : u8 = self.registers.get_u8register(register);
+
+        let (result, overflowed) = register_value.overflowing_sub(to_sub);
+
+        self.registers.set_flag(ZERO, result == 0);
+        self.registers.set_flag(SUBSTRACTION, false);
+        let half_carry = ((register_value & 0xF) + (to_sub & 0xF)) > 0xF;
+        self.registers.set_flag(HALFCARRY, half_carry);
+
+    }
+
+   
+// SWITCHLAND
 
     pub fn add_to_register(&mut self, test : Op){
         match test{
@@ -222,15 +219,49 @@ impl CPU {
                 self.add_value_reg8(register, 1, false, true),
                 
         _ => panic!("This is not an addition!"),
+        }
     }
-}
+
+    pub fn sub_to_register(&mut self, test : Op){
+        match test{
+            Op::Binop( opname, op1, op2) =>
+                match (opname, op1, op2) {
+                    (Binop::SUB, Operand::Reg8(register), Operand::Reg8(register2)) => 
+                        self.add_value_reg8(register, self.registers.get_u8register(register2), false, true),
+                    (Binop::SUB, Operand::Reg8(register), Operand::Imm8) => print!("TODO"),
+
+                    (Binop::SBC, op1, op2) => print!("TODO"),
+                    (_,_,_) => panic!("wtf")
+                }
+            Op::Unop(opname, Operand::Reg8(register)) => 
+                self.add_value_reg8(register, 1, false, true),
+                
+        _ => panic!("This is not an addition!"),
+        }
+    }
+
+    pub fn or(&mut self, reg1 : Operand, value: Operand){
+        match value {
+            Operand::Imm8 => panic!("Implement"),
+            Operand::Reg8(value) =>  self.or_register(reg1, self.registers.get_u8register(value)),
+            _ => panic!("this should not be happening"),
+        }
+    }
+
+    pub fn xor(&mut self, reg1 : Operand, value: Operand){
+        match value {
+            Operand::Imm8 => panic!("Implement"),
+            Operand::Reg8(value) =>  self.xor_register(reg1, self.registers.get_u8register(value)),
+            _ => panic!("this should not be happening"),
+        }
+    }
+
+
 
 }
 
 
-pub struct MemoryBus {
-    memory : [u8; 0xFFFF]
-}
+// ================================== REGISTERS =============================
 
 const ZERO : u8  = 7; //Z
 const SUBSTRACTION : u8 = 6; //N
@@ -247,7 +278,6 @@ pub struct Registers {
     h : u8, // HL 16 bits
     l : u8,
     sp : u16, // Stack pointer
-    pc : u16, // Program Counter
 }
 
 impl Registers {
@@ -321,3 +351,67 @@ impl Registers {
         }
     }    
 }
+
+// ================================== Memory =============================
+
+struct Memory{
+    rom0 : [u8; 16_384], 
+    romn : [u8; 16_384], 
+
+    vram : [u8; 8_192], 
+    ram : [u8; 8_192], 
+    
+    wram1: [u8; 4_096], 
+    wram2: [u8; 4_096], 
+    hram: [u8; 127], 
+
+    oam: [u8; 160], 
+
+    io: [u8; 128], 
+    interrupt: [u8; 1], 
+}
+
+impl Memory{
+    fn write(&mut self, address : u16 , value : u8){
+        let (region , address,_ ,writable) = self.map(address);
+
+        if writable {
+            region[address] = value;
+        }
+        
+    }
+
+    fn read(&mut self, address : u16 ) -> u8{
+        let (region , address, readable,_) = self.map(address);
+
+        if readable {
+            return region[address]
+        }
+
+        0xFF
+        
+    }
+
+    fn map ( &mut self, adress : u16) -> (&mut[u8], usize, bool, bool){
+        match adress {
+            0x0000..=0x3FFF => (& mut self.rom0, adress as usize , true, false ),
+            0x4000..=0x7FFF => (& mut self.romn, (adress - 0x4000) as usize, true, false),
+
+            0x8000..=0x9FFF => (& mut self.vram, (adress - 0x8000) as usize, true, true),
+            0xA000..=0xBFFF => (& mut self.ram, (adress - 0xA000) as usize, true, true),
+
+            0xC000..=0xCFFF => (& mut self.wram1, (adress - 0xC000) as usize, true, true),
+            0xD000..=0xDFFF => (& mut self.wram2, (adress - 0xD000) as usize, true, true),
+
+            0xFE00..=0xFE9F => (& mut self.oam, (adress - 0xFE00) as usize, true, true),
+            0xFF00..=0xFF7F => (& mut self.io, (adress - 0xFF00) as usize, true, true),
+            0xFF80..=0xFFFE => (& mut self.hram, (adress - 0xFF80) as usize, true, true),
+
+            0xFFFF..=0xFFFF => (& mut self.interrupt, 0, true, true),
+
+            0xE000..=0xFDFF => panic!("Echo RAM not implemented"),
+            0xFEA0..=0xFEFF => panic!("not usable memory"),
+        }
+    }
+}
+
