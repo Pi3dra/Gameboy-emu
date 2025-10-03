@@ -34,8 +34,6 @@ pub enum MemAdress{
     HLDec,
     AddrR8(Reg8),
     AddrR16(Reg16),
-    Addr8(u8),
-    Addr16(u16),
 }
 
 #[derive(Copy,Clone)]
@@ -57,6 +55,32 @@ pub struct CPU{
 }
 
 impl CPU {
+
+    fn get_operand_as_u8(&mut self, op: Operand) -> u8 {
+        match op{
+            Operand::Reg8(register) => self.registers.get_u8register(register),
+
+            Operand::MemAdress(MemAdress::AddrR16(register)) => {
+                let address = self.registers.get_16register(register);
+                self.bus.read(address)
+            }
+            // TODO: Increase or decrease this, need to implement addition for Reg16
+            Operand::MemAdress(MemAdress::HLInc) => {
+                let address = self.registers.get_16register(Reg16::HL);
+                self.bus.read(address)
+            }
+            Operand::MemAdress(MemAdress::HLDec) => {
+                let address = self.registers.get_16register(Reg16::HL);
+                self.bus.read(address)
+            }
+            Operand::Imm8 => {
+                let adress = (self.pc + 1)*8;
+                self.bus.read(adress)
+            }
+            _ => panic!("not a u8 operand!")
+
+        }
+    }
 
     fn update_pc_and_clock(&mut self, pc_increment : u16, clock_increment : u16){
         self.pc += pc_increment;
@@ -121,6 +145,11 @@ impl CPU {
         if !increment { self.registers.set_flag(CARRY, overflowed); }
     }
 
+    fn inc(&mut self, register: Reg8){
+        self.add_value_reg8(register, 1, true, false);
+    }
+
+
     fn sub_value_reg8(&mut self, reg_to : Operand , to_sub : u8, decrement : bool,use_carry : bool){
 
         let register : Reg8 = reg_to.as_reg8();
@@ -154,6 +183,7 @@ impl CPU {
         }
     }
 
+    //TODO: make a general register enum
     fn and_register(&mut self, reg1 : Operand, value : u8){
         let register = reg1.as_reg8();
         let result : u8 = self.registers.get_u8register(register) & value;
@@ -187,7 +217,7 @@ impl CPU {
         self.registers.set_flag(CARRY, false); 
     }
 
-    fn cp(&mut self, reg_to : Operand , to_sub : u8){
+    fn cp(&mut self, reg_to : Operand , to_sub : Operand){
 
         let register : Reg8 = reg_to.as_reg8();
         let register_value : u8 = self.registers.get_u8register(register);
@@ -201,7 +231,26 @@ impl CPU {
 
     }
 
-   
+
+
+// $CB Prefixed
+    
+    fn rlc(&mut self, op : Operand){}
+    fn rrc(&mut self, op : Operand){}
+
+    fn rl(&mut self, op : Operand){}
+    fn rr(&mut self, op : Operand){}
+
+    fn sla(&mut self, op : Operand){}
+    fn sra(&mut self, op : Operand){}
+
+    fn swap(&mut self, op: Operand){}
+    fn srl(&mut self, op : Operand){}
+
+    fn bit(&mut self, op : Operand, reg_index: Operand){}
+    fn res(&mut self, op : Operand, reg_index: Operand){}
+    fn set(&mut self, op : Operand, reg_index: Operand){}
+
 // SWITCHLAND
 
     pub fn add_to_register(&mut self, test : Op){
