@@ -1,348 +1,690 @@
-#![allow(dead_code,unused_variables)]
+#![allow(dead_code, unused_variables)]
 
-#[derive(Copy,Clone)]
-pub enum Binop{
-    LD , DEC, ADD, SUB, AND, OR, XOR, ADC, SBC, CP
-}
-
-#[derive(Copy,Clone)]
-pub enum Unop{
-    INC, DEC, PUSH
-}
-
-#[derive(Copy,Clone)]
-pub enum Op {
-    Binop(Binop, Operand, Operand),
-    Unop(Unop, Operand),
-}
-
-// TODO: Use this for Opcodes
-pub enum FuncDescriptor {
-    Binop( fn(&mut CPU, Operand, Operand) , Binop, Operand, Operand),
-    Unop( fn(&mut CPU, Operand) , Unop, Operand)
-}
-
+const ZERO: u8 = 7; //Z
+const SUBSTRACTION: u8 = 6; //N
+const HALFCARRY: u8 = 5; //H
+const CARRY: u8 = 4; //C
 
 #[derive(Clone, Copy)]
-pub enum Reg16 {AF, BC, DE, HL, SP, PC}
+pub enum Reg16 {
+    AF,
+    BC,
+    DE,
+    HL,
+    SP,
+    PC,
+}
 #[derive(Clone, Copy)]
-pub enum Reg8 { A, F, B, C, D, E , H, L}
-
-#[derive(Copy,Clone)]
-pub enum MemAdress{
-    HLInc,
-    HLDec,
-    AddrR8(Reg8),
-    AddrR16(Reg16),
+pub enum Reg8 {
+    A,
+    F,
+    B,
+    C,
+    D,
+    E,
+    H,
+    L,
 }
 
-#[derive(Copy,Clone)]
+#[derive(Copy, Clone)]
+pub enum MemAdress {
+    //memory is u8!
+    HLInc,          //[HL+]
+    HLDec,          //[HL-]
+    AddrR8(Reg8),   //[A]
+    AddrR16(Reg16), //[SP]
+    ImmAddr8,       //[a8]
+    ImmAddr16,      //[a16]
+    Fixed(u16),     // $18
+}
+
+#[derive(Copy, Clone)]
+pub enum FlagCondition {
+    NZ,   // Not Zero
+    Z,    // Zero
+    NC,   // Not Carry
+    C,    // Carry
+    None, // Unconditional (for JR e, CALL nn, etc.)
+}
+
+#[derive(Copy, Clone)]
 pub enum Operand {
-    Reg8(Reg8),
-    Reg16(Reg16),
-    MemAdress(MemAdress), // None == HL , Some(true) == HL+ , Some(false) == HL-
+    R8(Reg8),
+    R16(Reg16),
+    Address(MemAdress),
+    Flag(FlagCondition),
     Imm8,
     Imm16,
+    Value(u16), //Special for rst function
 }
 
 // ================================== CPU =============================
 
-pub struct CPU{
-    registers : Registers,
-    bus : Memory,
-    clock : u16,
-    pc : u16,
+pub struct CPU {
+    registers: Registers,
+    bus: Memory,
+    clock: u16,
+    ime: bool,         // Interrupt Master Enable
+    ime_pending: bool, // For delayed EI
+    halted: bool,
 }
 
+use FlagCondition::*;
+use MemAdress::*;
+use Operand::*;
+use Reg16::*;
 impl CPU {
+    fn check_condition(&mut self, op: Operand) -> bool {
+        match op {
+            Flag(NZ) => return !self.registers.get_flag(ZERO),
+            Flag(Z) => return self.registers.get_flag(ZERO),
+            Flag(NC) => return !self.registers.get_flag(CARRY),
+            Flag(C) => return self.registers.get_flag(CARRY),
+            Flag(None) => true,
+            _ => panic!("not a flag condition!"),
+        }
+    }
 
     fn get_operand_as_u8(&mut self, op: Operand) -> u8 {
-        match op{
-            Operand::Reg8(register) => self.registers.get_u8register(register),
+        match op {
+            R8(register) => self.registers.get_u8register(register),
 
-            Operand::MemAdress(MemAdress::AddrR16(register)) => {
+            Address(AddrR16(register)) => {
                 let address = self.registers.get_16register(register);
                 self.bus.read(address)
             }
+            Address(HLInc) => {
+                let address = self.registers.get_16register(HL);
+                self.registers.set_16register(HL, address.wrapping_add(1));
+                return self.bus.read(address);
+            }
+            Address(HLDec) => {
+                let address = self.registers.get_16register(HL);
+                self.registers.set_16register(HL, address.wrapping_sub(1));
+                return self.bus.read(address);
+            }
+            Imm8 => {
+                let address = self.registers.get_16register(PC);
+                self.registers.set_16register(PC, address.wrapping_add(1));
+                return self.bus.read(address);
+            }
+            Address(ImmAddr16) => {
+                let lsb = self.get_operand_as_u8(Imm8);
+                let msb = self.get_operand_as_u8(Imm8);
+                let address = CPU::fuse_u8(lsb, msb);
+                return self.bus.read(address);
+            }
+
+            //For LDH func
+            Address(ImmAddr8) => {
+                let offset = self.get_operand_as_u8(Imm8);
+                let address = 0xFF00u16 + offset as u16;
+                return self.bus.read(address);
+            }
+            Address(AddrR8(register)) => {
+                let offset = self.registers.get_u8register(register);
+                let address = 0xFF00u16 + offset as u16;
+                return self.bus.read(address);
+            }
+
+            //Address(Imm8) -> Do thhis
+            _ => panic!("not a u8 operand!"),
+        }
+    }
+
+    fn set_operand_from_u8(&mut self, op: Operand, value: u8) {
+        match op {
+            R8(register) => self.registers.set_u8register(register, value),
+
+            Address(AddrR16(register)) => {
+                let address = self.registers.get_16register(register);
+                self.bus.write(address, value)
+            }
             // TODO: Increase or decrease this, need to implement addition for Reg16
-            Operand::MemAdress(MemAdress::HLInc) => {
-                let address = self.registers.get_16register(Reg16::HL);
-                self.bus.read(address)
+            Address(HLInc) => {
+                let address = self.registers.get_16register(HL);
+                self.bus.write(address, value);
+                self.registers.set_16register(HL, address.wrapping_add(1));
             }
-            Operand::MemAdress(MemAdress::HLDec) => {
-                let address = self.registers.get_16register(Reg16::HL);
-                self.bus.read(address)
+            Address(HLDec) => {
+                let address = self.registers.get_16register(HL);
+                self.bus.write(address, value);
+                self.registers.set_16register(HL, address.wrapping_sub(1));
             }
-            Operand::Imm8 => {
-                let adress = (self.pc + 1)*8;
-                self.bus.read(adress)
+            Address(ImmAddr16) => {
+                let lsb = self.get_operand_as_u8(Imm8);
+                let msb = self.get_operand_as_u8(Imm8);
+                let address = CPU::fuse_u8(lsb, msb);
+                self.bus.write(address, value);
             }
-            _ => panic!("not a u8 operand!")
+            //For LDH func
+            Address(ImmAddr8) => {
+                let offset = self.get_operand_as_u8(Imm8);
+                let address = 0xFF00u16 + offset as u16;
+                self.bus.write(address, value)
+            }
+            Address(AddrR8(register)) => {
+                let offset = self.registers.get_u8register(register);
+                let address = 0xFF00u16 + offset as u16;
+                self.bus.write(address, value)
+            }
 
+            _ => panic!("not a u8 operand!"),
         }
     }
 
-    fn update_pc_and_clock(&mut self, pc_increment : u16, clock_increment : u16){
-        self.pc += pc_increment;
-        self.clock += clock_increment;
+    fn set_operand_to_u16(&mut self, op: Operand, value: u16) {
+        match op {
+            R16(register) => return self.registers.set_16register(register, value),
+            Address(ImmAddr16) => {
+                let (vlsb, vmsb) = CPU::split_u16(value);
+
+                let lsb = self.get_operand_as_u8(Imm8);
+                let msb = self.get_operand_as_u8(Imm8);
+
+                let address = CPU::fuse_u8(lsb, msb);
+                self.bus.write(address, vlsb);
+                self.bus.write(address + 1, vmsb);
+            }
+
+            _ => panic!("not a u16 operand!"),
+        }
     }
-    
-    // Load instructions
-    
-    fn ld_value_u8(&mut self, reg: Reg8, value : u8){
-        self.registers.set_u8register(reg, value);
-    }   
 
-    fn ld_u8(&mut self, operation: Op) {
-        match operation {
-            // TODO: make function get_value from operand 
-            Op::Binop(Binop::LD, operand1, operand2) => match (operand1, operand2) {
-                (Operand::Reg8(src), Operand::Reg8(dst)) => {
-                    let value = self.registers.get_u8register(src);
-                    self.ld_value_u8(src, value);
-                }
-                (Operand::Reg8(src), Operand::Imm8) => {
-                    let value : u8 =  self.bus.read(8*(self.pc + 1));
-                    self.ld_value_u8(src, value);
-                }
-                (Operand::Reg8(src), Operand::MemAdress(test)) => {
-                    let value : u8 =  self.bus.read(8*(self.pc + 1));
-                    self.ld_value_u8(src, value);
-                }
-
-
-                _ => println!("todo"),
-            },
-            _ => panic!("not a load"),
+    fn get_operand_as_u16(&mut self, op: Operand) -> u16 {
+        match op {
+            R16(register) => return self.registers.get_16register(register),
+            Imm16 => {
+                let lsb: u8 = self.get_operand_as_u8(Imm8);
+                let msb: u8 = self.get_operand_as_u8(Imm8);
+                return CPU::fuse_u8(lsb, msb);
+            }
+            Address(Fixed(value)) => return value,
+            Value(value) => return value,
+            _ => panic!("not a u16 operand!"),
+        }
     }
-}
-    
-      
-    // 8 bit arithmetic
-    
-    fn add_value_reg8(&mut self, register : Reg8, to_add : u8, increment : bool, use_carry : bool){
 
-        let register_value : u8 = self.registers.get_u8register(register);
+    fn get_timing(op1: Operand, op2: Operand) -> u16 {
+        //WARNING! This isn't generic, only works with certain functions.
+        //Used for LD, U8 Arithmetic
+        match (op1, op2) {
+            (Address(_), Imm8) => 12,
+            (Address(_), _) => 8,
+            (_, Imm8) => 8,
+            (_, Address(_)) => 8,
+            (_, _) => 4,
+        }
+    }
 
-        let to_add = if increment {1} else {to_add};
-        let (mut result, mut overflowed) = register_value.overflowing_add(to_add);
+    fn update_flags(&mut self, zero: bool, sub: bool, halfcarry: bool, carry: bool) {
+        self.registers.set_flag(ZERO, zero);
+        self.registers.set_flag(SUBSTRACTION, sub);
+        self.registers.set_flag(HALFCARRY, halfcarry);
+        self.registers.set_flag(CARRY, carry);
+    }
 
-        //ADC implementation
-        if use_carry {
-            let (result2, overflowed2) = result.overflowing_add(self.registers.get_flag(CARRY) as u8);
-            result = result2;
-            overflowed = overflowed | overflowed2;
+    fn split_u16(value: u16) -> (u8, u8) {
+        let lsb = (value & 0xFF) as u8;
+        let msb = (value >> 8) as u8;
+        (lsb, msb)
+    }
+
+    fn fuse_u8(lsb: u8, msb: u8) -> u16 {
+        ((msb as u16) << 8) | (lsb as u16)
+    }
+
+    // ============= Loading =============
+
+    //this implements both ldh and ld, clock is not right thoug
+    fn ld_u8(&mut self, destination: Operand, source: Operand) {
+        let val_to_load: u8 = self.get_operand_as_u8(source);
+
+        self.set_operand_from_u8(destination, val_to_load);
+        self.clock += CPU::get_timing(destination, source);
+    }
+
+    fn ld_u16(&mut self, destination: Operand, source: Operand) {
+        // I think this doesn't properly implement LD [a16] SP
+        let val_to_load: u16 = self.get_operand_as_u16(source);
+        self.set_operand_to_u16(destination, val_to_load);
+
+        self.clock += CPU::get_timing(destination, source);
+    }
+
+    fn ld_u16_e8(&mut self, destination: Operand, _source: Operand) {
+        let e8 = self.get_operand_as_u8(Operand::Imm8) as i8;
+        let sp = self.get_operand_as_u16(Operand::R16(Reg16::SP));
+
+        let result = sp.wrapping_add_signed(e8 as i16);
+
+        self.set_operand_to_u16(destination, result);
+
+        let h = ((sp & 0xF) + ((e8 as u16) & 0xF)) > 0xF;
+        let c = ((sp & 0xFF) + ((e8 as u16) & 0xFF)) > 0xFF;
+        self.update_flags(false, false, h, c);
+
+        self.clock += 12;
+    }
+
+    // ============= Arithmetic =============
+
+    fn add(&mut self, op1: Operand, op2: Operand) {
+        let value1: u8 = self.get_operand_as_u8(op1);
+        let value2: u8 = self.get_operand_as_u8(op2);
+        let (result, overflowed) = value1.overflowing_add(value2);
+
+        //Addition always stores back on a register
+        self.set_operand_from_u8(op1, result);
+
+        let half_carry: bool = ((value1 & 0xF) + (value2 & 0xF)) > 0xF;
+        self.update_flags(result == 0, false, half_carry, overflowed);
+        self.clock += CPU::get_timing(op1, op2);
+    }
+
+    fn adc(&mut self, op1: Operand, op2: Operand) {
+        let value1: u8 = self.get_operand_as_u8(op1);
+        let value2: u8 = self.get_operand_as_u8(op2);
+        let carry_in: u8 = self.registers.get_flag(CARRY) as u8;
+
+        let (intermediate, carry1) = value1.overflowing_add(value2);
+        let (result, carry2) = intermediate.overflowing_add(carry_in);
+
+        //Addition always stores back on a register
+        self.set_operand_from_u8(op1, result);
+
+        let carry: bool = carry1 || carry2;
+        let half_carry = ((value1 & 0xF) + (value2 & 0xF) + carry_in) > 0xF;
+        self.update_flags(result == 0, false, half_carry, carry);
+        self.clock += CPU::get_timing(op1, op2);
+    }
+
+    fn sbc(&mut self, op1: Operand, op2: Operand) {
+        let value1: u8 = self.get_operand_as_u8(op1);
+        let value2: u8 = self.get_operand_as_u8(op2);
+        let carry_in: u8 = self.registers.get_flag(CARRY) as u8;
+
+        let (intermediate, borrow1) = value1.overflowing_sub(value2);
+        let (result, borrow2) = intermediate.overflowing_sub(carry_in);
+
+        let borrow = borrow1 || borrow2;
+
+        self.set_operand_from_u8(op1, result);
+        let half_carry = (value1 & 0xF) < ((value2 & 0xF) + carry_in);
+        self.update_flags(result == 0, true, half_carry, borrow);
+    }
+
+    fn inc(&mut self, op1: Operand) {
+        let value: u8 = self.get_operand_as_u8(op1);
+        let (result, overflowed) = value.overflowing_add(1);
+
+        //Addition always stores back on a register
+        self.set_operand_from_u8(op1, result);
+
+        let half_carry: bool = ((value & 0xF) + (1 & 0xF)) > 0xF;
+        let carry: bool = self.registers.get_flag(CARRY);
+        self.update_flags(result == 0, false, half_carry, carry);
+
+        //TODO: This doesn't properly work
+        self.clock += CPU::get_timing(op1, Imm8);
+    }
+
+    fn sub(&mut self, op1: Operand, op2: Operand) {
+        let value1: u8 = self.get_operand_as_u8(op1);
+        let value2: u8 = self.get_operand_as_u8(op2);
+        let (result, overflowed) = value1.overflowing_sub(value2);
+
+        //Addition always stores back on a register
+        self.set_operand_from_u8(op1, result);
+
+        let half_carry: bool = (value1 & 0xF) < (value2 & 0xF);
+        self.update_flags(result == 0, true, half_carry, overflowed);
+        self.clock += CPU::get_timing(op1, op2);
+    }
+
+    fn dec(&mut self, op1: Operand) {
+        let value: u8 = self.get_operand_as_u8(op1);
+        let (result, overflowed) = value.overflowing_sub(1);
+
+        self.set_operand_from_u8(op1, result);
+
+        let half_carry: bool = (value & 0xF) < (1 & 0xF);
+        let keep_carry: bool = self.registers.get_flag(CARRY);
+        self.update_flags(result == 0, true, half_carry, keep_carry);
+        //TODO: This doesn't properly work
+        //move this to an outer structure!!!!!!! Fetch, decode, execute
+        self.clock += CPU::get_timing(op1, Imm8);
+    }
+
+    fn and(&mut self, source: Operand, op: Operand) {
+        let register_value = self.get_operand_as_u8(source);
+        let result: u8 = register_value & self.get_operand_as_u8(op);
+
+        self.set_operand_from_u8(source, result);
+        self.update_flags(result == 0, false, false, false);
+    }
+
+    fn or(&mut self, source: Operand, op: Operand) {
+        let register_value = self.get_operand_as_u8(source);
+        let result: u8 = register_value | self.get_operand_as_u8(op);
+
+        self.set_operand_from_u8(source, result);
+        self.update_flags(result == 0, false, false, false);
+    }
+
+    fn xor(&mut self, source: Operand, op: Operand) {
+        let register_value = self.get_operand_as_u8(source);
+        let result: u8 = register_value ^ self.get_operand_as_u8(op);
+        self.set_operand_from_u8(source, result);
+
+        self.update_flags(result == 0, false, false, false);
+    }
+
+    fn cp(&mut self, source: Operand, op: Operand) {
+        let register_value = self.get_operand_as_u8(source);
+        let to_sub: u8 = self.get_operand_as_u8(op);
+
+        let (result, carry) = register_value.overflowing_sub(to_sub);
+
+        let half_carry: bool = (register_value & 0xF) < (to_sub & 0xF);
+        self.update_flags(result == 0, true, half_carry, carry);
+    }
+
+    // ============= reg16 Arithmetic =============
+    fn inc_u16(&mut self, op: Operand) {
+        let value = self.get_operand_as_u16(op);
+        self.set_operand_to_u16(op, value + 1);
+        self.clock += 8;
+    }
+
+    fn dec_u16(&mut self, op: Operand) {
+        let value = self.get_operand_as_u16(op);
+        self.set_operand_to_u16(op, value - 1);
+        self.clock += 8;
+    }
+
+    fn add_hl_rr(&mut self, src: Operand) {
+        let hl = self.registers.get_16register(Reg16::HL);
+        let value = self.get_operand_as_u16(src);
+
+        let (result, carry) = hl.overflowing_add(value);
+        let half_carry = ((hl & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF;
+
+        self.registers.set_16register(Reg16::HL, result);
+
+        self.update_flags(self.registers.get_flag(ZERO), false, half_carry, carry);
+
+        self.clock += 8;
+    }
+
+    fn add_sp_e8(&mut self) {
+        let sp = self.registers.get_16register(Reg16::SP);
+        let offset = self.get_operand_as_u8(Operand::Imm8) as i8 as i16; // signed immediate
+
+        let result = sp.wrapping_add(offset as u16);
+
+        let half_carry = ((sp & 0xF) + ((offset as u16) & 0xF)) > 0xF;
+        let carry = ((sp & 0xFF) + ((offset as u16) & 0xFF)) > 0xFF;
+
+        self.registers.set_16register(Reg16::SP, result);
+        self.update_flags(false, false, half_carry, carry);
+
+        self.clock += 16;
+    }
+
+    // ============= Jumps and Calls =============
+
+    fn jr(&mut self, condition: Operand, op: Operand) {
+        let offset = self.get_operand_as_u8(op) as i8;
+
+        if self.check_condition(condition) {
+            let pc: u16 = self.registers.get_16register(PC);
+            //Not really sure this offset works?
+            self.registers
+                .set_16register(PC, pc.wrapping_add(offset as u16));
+            self.clock += 12;
+        } else {
+            self.clock += 8;
+        }
+    }
+
+    fn jp(&mut self, condition: Operand, address: Operand) {
+        let address = self.get_operand_as_u16(address);
+        if self.check_condition(condition) {
+            self.registers.set_16register(PC, address);
+            self.clock += 16;
+        } else {
+            self.clock += 12;
+        }
+    }
+
+    fn call(&mut self, condition: Operand, address_operand: Operand) {
+        let addr = self.get_operand_as_u16(address_operand);
+        if self.check_condition(condition) {
+            let pc = self.registers.get_16register(PC);
+
+            let mut sp = self.registers.get_16register(SP);
+            sp = sp.wrapping_sub(1);
+            self.bus.write(sp, (pc >> 8) as u8); // MSB
+            sp = sp.wrapping_sub(1);
+            self.bus.write(sp, pc as u8); // LSB
+            self.registers.set_16register(SP, sp);
+
+            self.registers.set_16register(PC, addr);
+
+            self.clock += 24;
+        } else {
+            self.clock += 12;
+        }
+    }
+
+    fn rst(&mut self, address: Operand) {
+        //This func is very similar to call
+        let address_value = self.get_operand_as_u16(address);
+        let pc = self.registers.get_16register(PC);
+
+        let mut sp = self.registers.get_16register(SP);
+        sp = sp.wrapping_sub(1);
+        self.bus.write(sp, (pc >> 8) as u8); // MSB
+        sp = sp.wrapping_sub(1);
+        self.bus.write(sp, pc as u8); // LSB
+        self.registers.set_16register(SP, sp);
+
+        self.registers.set_16register(PC, address_value as u16);
+
+        self.clock += 16;
+    }
+
+    fn ret(&mut self, condition: Operand) {
+        if self.check_condition(condition) {
+            let sp = self.registers.get_16register(SP);
+            //Not sure of ordering here, is the stack little or big endian?
+            let lsb = self.bus.read(sp);
+            let msb = self.bus.read(sp + 1);
+
+            if let Operand::Flag(None) = condition {
+                self.clock += 16;
+            } else {
+                self.clock += 16;
+            }
+        } else {
+            self.clock += 8;
+        }
+    }
+
+    fn reti(&mut self) {
+        self.ret(Flag(None));
+        self.ei();
+        self.clock -= 4; // To remove extra 4 ticks from ei
+    }
+
+    fn push(&mut self, op: Operand) {
+        let value = self.get_operand_as_u16(op);
+        let (lsb, msb) = CPU::split_u16(value);
+
+        let mut sp = self.registers.get_16register(SP);
+
+        self.bus.write(sp, lsb);
+        sp = sp.wrapping_sub(1);
+        self.bus.write(sp, msb);
+        sp = sp.wrapping_sub(1);
+
+        self.registers.set_16register(SP, sp);
+
+        self.clock += 16;
+    }
+
+    fn pop(&mut self, op: Operand) {
+        let mut sp = self.registers.get_16register(SP);
+
+        let lsb = self.bus.read(sp);
+        sp = sp.wrapping_add(1);
+        let msb = self.bus.read(sp);
+        sp = sp.wrapping_add(1);
+        let mut value = CPU::fuse_u8(lsb, msb);
+
+        // Special handling for AF: lower nibble of F must be 0
+        if let Operand::R16(Reg16::AF) = op {
+            value &= 0xFFF0;
         }
 
-
-        self.registers.set_u8register(register,result);
-        self.registers.set_flag(ZERO, result == 0);
-        self.registers.set_flag(SUBSTRACTION, false);
-        let half_carry = ((register_value & 0xF) + (to_add & 0xF)) > 0xF;
-        self.registers.set_flag(HALFCARRY, half_carry);
-
-        // to differentiate decreases or increases
-        if !increment { self.registers.set_flag(CARRY, overflowed); }
+        self.set_operand_to_u16(op, value);
+        self.registers.set_16register(SP, sp);
+        self.clock += 12;
     }
 
-    fn inc(&mut self, register: Reg8){
-        self.add_value_reg8(register, 1, true, false);
+    // ============= Interrupts and Misc =============
+
+    fn ei(&mut self) {
+        self.ime_pending = true;
+        self.clock += 4;
     }
 
+    fn di(&mut self) {
+        self.ime = false; // Immediately disable interrupts
+        self.ime_pending = false; // Make sure no pending enable remains
+        self.clock += 4; // 1 machine cycle
+    }
 
-    fn sub_value_reg8(&mut self, reg_to : Operand , to_sub : u8, decrement : bool,use_carry : bool){
+    fn nop(&mut self) {
+        self.clock = 4;
+    }
 
-        let register : Reg8 = reg_to.as_reg8();
-        let register_value : u8 = self.registers.get_u8register(register);
-
-        let (mut result,mut overflowed) = register_value.overflowing_sub(to_sub);
+    fn halt(&mut self) {
+        self.halted = true;
+        self.clock += 4; // HALT instruction takes 4 cycles
         
-        //SBC implementation
-        if use_carry {
-            let (result2, overflowed2) = result.overflowing_add(self.registers.get_flag(CARRY) as u8);
-            result = result2;
-            overflowed = overflowed | overflowed2;
-        }
+        /*
 
-        self.registers.set_u8register(register,result);
-        
-        self.registers.set_flag(ZERO, result == 0);
+        FOR FUTURE ME:
+        You need to handle the HALT bug:
+        if IME = 0 and an interrupt is pending,
+        the PC increments incorrectly.
+        while running {
+            if cpu.halted {
+            // Resume execution only if an interrupt is pending
+            if cpu.interrupt_pending() {
+                cpu.halted = false;
+            } else {
+                // CPU is halted, skip instruction fetch/execute
+                cpu.clock += 4; // CPU still increments clock slowly
+                continue;
+            }
+        }
+        */
+    }
+
+    //set carry flag
+    fn scf(&mut self) {
+        let zero = self.registers.get_flag(ZERO);
+        self.update_flags(zero, false, false, true);
+        self.clock += 4;
+    }
+
+    //complement carry flag
+    fn ccf(&mut self) {
+        let zero = self.registers.get_flag(ZERO);
+        let carry = self.registers.get_flag(CARRY);
+        self.update_flags(zero, false, false, !carry);
+        self.clock += 4;
+    }
+
+    fn cpl(&mut self) {
+        let a = self.registers.get_u8register(Reg8::A);
+        let result = !a;
+
+        self.registers.set_u8register(Reg8::A, result);
         self.registers.set_flag(SUBSTRACTION, true);
-        let half_carry = ((register_value & 0xF) + (to_sub & 0xF)) > 0xF;
-        self.registers.set_flag(HALFCARRY, half_carry);
-
-        // to differentiate decreases or increases
-        if !decrement { self.registers.set_flag(CARRY, overflowed); }
-    }
-
-    pub fn and(&mut self, reg1 : Operand, value: Operand){
-        match value {
-            Operand::Imm8 => panic!("Implement"),
-            Operand::Reg8(value) =>  self.and_register(reg1, self.registers.get_u8register(value)),
-            _ => panic!("this should not be happening"),
-        }
-    }
-
-    //TODO: make a general register enum
-    fn and_register(&mut self, reg1 : Operand, value : u8){
-        let register = reg1.as_reg8();
-        let result : u8 = self.registers.get_u8register(register) & value;
-        self.registers.set_u8register(register, result);
-
-        self.registers.set_flag(ZERO, result == 0);
-        self.registers.set_flag(SUBSTRACTION, false);
         self.registers.set_flag(HALFCARRY, true);
-        self.registers.set_flag(CARRY, false); 
+
+        self.clock += 4; // CPL instruction takes 1 machine cycle (4 t-states)
     }
 
-    fn or_register(&mut self, reg1 : Operand, value : u8){
-        let register = reg1.as_reg8();
-        let result : u8 = self.registers.get_u8register(register) | value;
-        self.registers.set_u8register(register, result);
-
-        self.registers.set_flag(ZERO, result == 0);
-        self.registers.set_flag(SUBSTRACTION, false);
-        self.registers.set_flag(HALFCARRY, false);
-        self.registers.set_flag(CARRY, false); 
+    fn stop(&mut self, op: Operand) {
+        self.clock = 4;
+        panic!("Is STOP really needed?");
+        //This has some weird hardware behavior
+        //Chek a lot of documentation if implemented in future!
     }
-
-    fn xor_register(&mut self, reg1 : Operand, value : u8){
-        let register = reg1.as_reg8();
-        let result : u8 = self.registers.get_u8register(register) ^ value;
-        self.registers.set_u8register(register, result);
-
-        self.registers.set_flag(ZERO, result == 0);
-        self.registers.set_flag(SUBSTRACTION, false);
-        self.registers.set_flag(HALFCARRY, false);
-        self.registers.set_flag(CARRY, false); 
-    }
-
-    fn cp(&mut self, reg_to : Operand , to_sub : Operand){
-
-        let register : Reg8 = reg_to.as_reg8();
-        let register_value : u8 = self.registers.get_u8register(register);
-
-        let (result, overflowed) = register_value.overflowing_sub(to_sub);
-
-        self.registers.set_flag(ZERO, result == 0);
-        self.registers.set_flag(SUBSTRACTION, false);
-        let half_carry = ((register_value & 0xF) + (to_sub & 0xF)) > 0xF;
-        self.registers.set_flag(HALFCARRY, half_carry);
-
-    }
-
-
-
-// $CB Prefixed
-    
-    fn rlc(&mut self, op : Operand){}
-    fn rrc(&mut self, op : Operand){}
-
-    fn rl(&mut self, op : Operand){}
-    fn rr(&mut self, op : Operand){}
-
-    fn sla(&mut self, op : Operand){}
-    fn sra(&mut self, op : Operand){}
-
-    fn swap(&mut self, op: Operand){}
-    fn srl(&mut self, op : Operand){}
-
-    fn bit(&mut self, op : Operand, reg_index: Operand){}
-    fn res(&mut self, op : Operand, reg_index: Operand){}
-    fn set(&mut self, op : Operand, reg_index: Operand){}
-
-// SWITCHLAND
-
-    pub fn add_to_register(&mut self, test : Op){
-        match test{
-            Op::Binop( opname, op1, op2) =>
-                match (opname, op1, op2) {
-                    (Binop::ADD, Operand::Reg8(register), Operand::Reg8(register2)) => 
-                        self.add_value_reg8(register, self.registers.get_u8register(register2), false, true),
-                    (Binop::ADD, Operand::Reg8(register), Operand::Imm8) => print!("TODO"),
-
-                    (Binop::ADC, op1, op2) => print!("TODO"),
-                    (_,_,_) => panic!("wtf")
-                }
-            Op::Unop(opname, Operand::Reg8(register)) => 
-                self.add_value_reg8(register, 1, false, true),
-                
-        _ => panic!("This is not an addition!"),
+    // Call this after every instruction fetch/execute
+    fn update_ime(&mut self) {
+        if self.ime_pending {
+            self.ime = true;
+            self.ime_pending = false;
         }
     }
 
-    pub fn sub_to_register(&mut self, test : Op){
-        match test{
-            Op::Binop( opname, op1, op2) =>
-                match (opname, op1, op2) {
-                    (Binop::SUB, Operand::Reg8(register), Operand::Reg8(register2)) => 
-                        self.add_value_reg8(register, self.registers.get_u8register(register2), false, true),
-                    (Binop::SUB, Operand::Reg8(register), Operand::Imm8) => print!("TODO"),
+    //TODO: Implement RST with MemAdress, add an extra field, Fixed
 
-                    (Binop::SBC, op1, op2) => print!("TODO"),
-                    (_,_,_) => panic!("wtf")
-                }
-            Op::Unop(opname, Operand::Reg8(register)) => 
-                self.add_value_reg8(register, 1, false, true),
-                
-        _ => panic!("This is not an addition!"),
-        }
-    }
+    // ==================== ENDOF NEW AND IMPROVED FUNCS ====================
 
-    pub fn or(&mut self, reg1 : Operand, value: Operand){
-        match value {
-            Operand::Imm8 => panic!("Implement"),
-            Operand::Reg8(value) =>  self.or_register(reg1, self.registers.get_u8register(value)),
-            _ => panic!("this should not be happening"),
-        }
-    }
+    // $CB Prefixed
 
-    pub fn xor(&mut self, reg1 : Operand, value: Operand){
-        match value {
-            Operand::Imm8 => panic!("Implement"),
-            Operand::Reg8(value) =>  self.xor_register(reg1, self.registers.get_u8register(value)),
-            _ => panic!("this should not be happening"),
-        }
-    }
+    fn rlc(&mut self, op: Operand) {}
+    fn rrc(&mut self, op: Operand) {}
 
+    fn rl(&mut self, op: Operand) {}
+    fn rr(&mut self, op: Operand) {}
 
+    fn sla(&mut self, op: Operand) {}
+    fn sra(&mut self, op: Operand) {}
 
+    fn swap(&mut self, op: Operand) {}
+    fn srl(&mut self, op: Operand) {}
+
+    fn bit(&mut self, op: Operand, reg_index: Operand) {}
+    fn res(&mut self, op: Operand, reg_index: Operand) {}
+    fn set(&mut self, op: Operand, reg_index: Operand) {}
 }
-
 
 // ================================== REGISTERS =============================
 
-const ZERO : u8  = 7; //Z
-const SUBSTRACTION : u8 = 6; //N
-const HALFCARRY : u8 = 5; //H
-const CARRY : u8 = 4; //C
-
 pub struct Registers {
-    a : u8,
-    f : u8, // Flags register 4: carry 5: half_carry 6: sub 7: zero
-    b : u8, // BC 16 bits
-    c : u8,
-    d : u8, // DE 16 bits
-    e : u8,
-    h : u8, // HL 16 bits
-    l : u8,
-    sp : u16, // Stack pointer
+    a: u8,
+    f: u8, // Flags register 4: carry 5: half_carry 6: sub 7: zero
+    b: u8, // BC 16 bits
+    c: u8,
+    d: u8, // DE 16 bits
+    e: u8,
+    h: u8, // HL 16 bits
+    l: u8,
+    sp: u16, // Stack pointer
+    pc: u16,
 }
 
 impl Registers {
-
-    fn set_flag(&mut self, bit_idx : u8, flag : bool){
+    fn set_flag(&mut self, bit_idx: u8, flag: bool) {
         self.f = self.f | ((flag as u8) << bit_idx) //Bitwise or 
     }
 
-    fn get_flag(& self, bit_idx : u8) -> bool{
+    fn get_flag(&self, bit_idx: u8) -> bool {
         let mask = 1 << bit_idx;
         self.f & mask != 0
     }
 
-    fn get_16register(&self, register : Reg16) -> u16 {
-        fn concat_registers(reg1 : u8, reg2: u8) -> u16 {
-            ((reg1 as u16) << 8 ) | (reg2 as u16)
+    fn get_16register(&self, register: Reg16) -> u16 {
+        fn concat_registers(reg1: u8, reg2: u8) -> u16 {
+            ((reg1 as u16) << 8) | (reg2 as u16)
         }
         match register {
             Reg16::SP => self.sp,
@@ -352,11 +694,10 @@ impl Registers {
             Reg16::DE => concat_registers(self.d, self.e),
             Reg16::HL => concat_registers(self.h, self.l),
         }
-    } 
+    }
 
-    fn set_16register(&mut self, register : Reg16, value : u16){
-
-        fn set_registers(reg1 : &mut u8, reg2: &mut u8, value : u16){
+    fn set_16register(&mut self, register: Reg16, value: u16) {
+        fn set_registers(reg1: &mut u8, reg2: &mut u8, value: u16) {
             let high: u8 = (value >> 8) as u8;
             let low: u8 = (value & 0xFF) as u8;
 
@@ -374,7 +715,7 @@ impl Registers {
         }
     }
 
-    fn get_u8register(&self , register : Reg8) -> u8 {
+    fn get_u8register(&self, register: Reg8) -> u8 {
         match register {
             Reg8::A => self.a,
             Reg8::F => self.f,
@@ -387,7 +728,7 @@ impl Registers {
         }
     }
 
-    fn set_u8register(&mut self , register : Reg8 , value : u8){
+    fn set_u8register(&mut self, register: Reg8, value: u8) {
         match register {
             Reg8::A => self.a = value,
             Reg8::F => self.f = value,
@@ -398,69 +739,66 @@ impl Registers {
             Reg8::H => self.h = value,
             Reg8::E => self.e = value,
         }
-    }    
+    }
 }
 
 // ================================== Memory =============================
 
-struct Memory{
-    rom0 : [u8; 16_384], 
-    romn : [u8; 16_384], 
+struct Memory {
+    rom0: [u8; 16_384],
+    romn: [u8; 16_384],
 
-    vram : [u8; 8_192], 
-    ram : [u8; 8_192], 
-    
-    wram1: [u8; 4_096], 
-    wram2: [u8; 4_096], 
-    hram: [u8; 127], 
+    vram: [u8; 8_192],
+    ram: [u8; 8_192],
 
-    oam: [u8; 160], 
+    wram1: [u8; 4_096],
+    wram2: [u8; 4_096],
+    hram: [u8; 127],
 
-    io: [u8; 128], 
-    interrupt: [u8; 1], 
+    oam: [u8; 160],
+
+    io: [u8; 128],
+    interrupt: [u8; 1],
 }
 
-impl Memory{
-    fn write(&mut self, address : u16 , value : u8){
-        let (region , address,_ ,writable) = self.map(address);
+impl Memory {
+    fn write(&mut self, address: u16, value: u8) {
+        let (region, address, _, writable) = self.map(address);
 
         if writable {
             region[address] = value;
         }
-        
     }
 
-    fn read(&mut self, address : u16 ) -> u8{
-        let (region , address, readable,_) = self.map(address);
+    fn read(&mut self, address: u16) -> u8 {
+        let (region, address, readable, _) = self.map(address);
 
         if readable {
-            return region[address]
+            return region[address];
         }
 
         0xFF
-        
     }
 
-    fn map ( &mut self, adress : u16) -> (&mut[u8], usize, bool, bool){
+    fn map(&mut self, adress: u16) -> (&mut [u8], usize, bool, bool) {
         match adress {
-            0x0000..=0x3FFF => (& mut self.rom0, adress as usize , true, false ),
-            0x4000..=0x7FFF => (& mut self.romn, (adress - 0x4000) as usize, true, false),
+            0x0000..=0x3FFF => (&mut self.rom0, adress as usize, true, false),
+            0x4000..=0x7FFF => (&mut self.romn, (adress - 0x4000) as usize, true, false),
 
-            0x8000..=0x9FFF => (& mut self.vram, (adress - 0x8000) as usize, true, true),
-            0xA000..=0xBFFF => (& mut self.ram, (adress - 0xA000) as usize, true, true),
+            0x8000..=0x9FFF => (&mut self.vram, (adress - 0x8000) as usize, true, true),
+            0xA000..=0xBFFF => (&mut self.ram, (adress - 0xA000) as usize, true, true),
 
-            0xC000..=0xCFFF => (& mut self.wram1, (adress - 0xC000) as usize, true, true),
-            0xD000..=0xDFFF => (& mut self.wram2, (adress - 0xD000) as usize, true, true),
+            0xC000..=0xCFFF => (&mut self.wram1, (adress - 0xC000) as usize, true, true),
+            0xD000..=0xDFFF => (&mut self.wram2, (adress - 0xD000) as usize, true, true),
 
-            0xFE00..=0xFE9F => (& mut self.oam, (adress - 0xFE00) as usize, true, true),
-            0xFF00..=0xFF7F => (& mut self.io, (adress - 0xFF00) as usize, true, true),
-            0xFF80..=0xFFFE => (& mut self.hram, (adress - 0xFF80) as usize, true, true),
+            0xFE00..=0xFE9F => (&mut self.oam, (adress - 0xFE00) as usize, true, true),
+            0xFF00..=0xFF7F => (&mut self.io, (adress - 0xFF00) as usize, true, true),
+            0xFF80..=0xFFFE => (&mut self.hram, (adress - 0xFF80) as usize, true, true),
 
-            0xFFFF..=0xFFFF => (& mut self.interrupt, 0, true, true),
+            0xFFFF..=0xFFFF => (&mut self.interrupt, 0, true, true),
 
             0xE000..=0xFDFF => panic!("Echo RAM not implemented"),
             0xFEA0..=0xFEFF => panic!("not usable memory"),
         }
     }
 }
-
