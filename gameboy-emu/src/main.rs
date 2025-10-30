@@ -1,10 +1,10 @@
 #![allow(dead_code)]
-mod cpu;
-mod opcodes;
-
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Read;
+
+mod cpu;
+use crate::cpu::CPU;
 
 fn main() {
     let rom_buffer = BufReader::new(File::open("../../Tetris (World) (Rev A).gb").unwrap());

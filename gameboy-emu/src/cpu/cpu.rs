@@ -1,65 +1,14 @@
 #![allow(dead_code, unused_variables)]
-
 const ZERO: u8 = 7; //Z
 const SUBSTRACTION: u8 = 6; //N
 const HALFCARRY: u8 = 5; //H
 const CARRY: u8 = 4; //C
 
-#[derive(Clone, Copy)]
-pub enum Reg16 {
-    AF,
-    BC,
-    DE,
-    HL,
-    SP,
-    PC,
-}
-#[derive(Clone, Copy)]
-pub enum Reg8 {
-    A,
-    F,
-    B,
-    C,
-    D,
-    E,
-    H,
-    L,
-}
-
-#[derive(Copy, Clone)]
-pub enum MemAdress {
-    //memory is u8!
-    HLInc,          //[HL+]
-    HLDec,          //[HL-]
-    AddrR8(Reg8),   //[A]
-    AddrR16(Reg16), //[SP]
-    ImmAddr8,       //[a8]
-    ImmAddr16,      //[a16]
-    Fixed(u16),     // $18
-}
-
-#[derive(Copy, Clone)]
-pub enum FlagCondition {
-    NZ,   // Not Zero
-    Z,    // Zero
-    NC,   // Not Carry
-    C,    // Carry
-    None, // Unconditional (for JR e, CALL nn, etc.)
-}
-
-#[derive(Copy, Clone)]
-pub enum Operand {
-    R8(Reg8),
-    R16(Reg16),
-    Address(MemAdress),
-    Flag(FlagCondition),
-    Imm8,
-    Imm16,
-    Value(u16), //Special for rst function
-}
+use super::{FlagCondition, MemAdress, Operand, Reg8, Reg16};
 
 // ================================== CPU =============================
 
+// Making the opcode decoding a child of CPU!
 pub struct CPU {
     registers: Registers,
     bus: Memory,
@@ -140,7 +89,6 @@ impl CPU {
                 let address = self.registers.get_16register(register);
                 self.bus.write(address, value)
             }
-            // TODO: Increase or decrease this, need to implement addition for Reg16
             Address(HLInc) => {
                 let address = self.registers.get_16register(HL);
                 self.bus.write(address, value);
@@ -205,18 +153,6 @@ impl CPU {
         }
     }
 
-    fn get_timing(op1: Operand, op2: Operand) -> u16 {
-        //WARNING! This isn't generic, only works with certain functions.
-        //Used for LD, U8 Arithmetic
-        match (op1, op2) {
-            (Address(_), Imm8) => 12,
-            (Address(_), _) => 8,
-            (_, Imm8) => 8,
-            (_, Address(_)) => 8,
-            (_, _) => 4,
-        }
-    }
-
     fn update_flags(&mut self, zero: bool, sub: bool, halfcarry: bool, carry: bool) {
         self.registers.set_flag(ZERO, zero);
         self.registers.set_flag(SUBSTRACTION, sub);
@@ -236,23 +172,19 @@ impl CPU {
 
     // ============= Loading =============
 
-    //this implements both ldh and ld, clock is not right thoug
-    fn ld_u8(&mut self, destination: Operand, source: Operand) {
+    //this implements both ldh and ld
+    pub(crate) fn ld_u8(&mut self, destination: Operand, source: Operand) {
         let val_to_load: u8 = self.get_operand_as_u8(source);
-
         self.set_operand_from_u8(destination, val_to_load);
-        self.clock += CPU::get_timing(destination, source);
     }
 
-    fn ld_u16(&mut self, destination: Operand, source: Operand) {
+    pub(crate) fn ld_u16(&mut self, destination: Operand, source: Operand) {
         // I think this doesn't properly implement LD [a16] SP
         let val_to_load: u16 = self.get_operand_as_u16(source);
         self.set_operand_to_u16(destination, val_to_load);
-
-        self.clock += CPU::get_timing(destination, source);
     }
 
-    fn ld_u16_e8(&mut self, destination: Operand, _source: Operand) {
+    pub(crate) fn ld_u16_e8(&mut self, destination: Operand, _source: Operand) {
         let e8 = self.get_operand_as_u8(Operand::Imm8) as i8;
         let sp = self.get_operand_as_u16(Operand::R16(Reg16::SP));
 
@@ -263,13 +195,11 @@ impl CPU {
         let h = ((sp & 0xF) + ((e8 as u16) & 0xF)) > 0xF;
         let c = ((sp & 0xFF) + ((e8 as u16) & 0xFF)) > 0xFF;
         self.update_flags(false, false, h, c);
-
-        self.clock += 12;
     }
 
     // ============= Arithmetic =============
 
-    fn add(&mut self, op1: Operand, op2: Operand) {
+    pub(crate) fn add(&mut self, op1: Operand, op2: Operand) {
         let value1: u8 = self.get_operand_as_u8(op1);
         let value2: u8 = self.get_operand_as_u8(op2);
         let (result, overflowed) = value1.overflowing_add(value2);
@@ -279,10 +209,9 @@ impl CPU {
 
         let half_carry: bool = ((value1 & 0xF) + (value2 & 0xF)) > 0xF;
         self.update_flags(result == 0, false, half_carry, overflowed);
-        self.clock += CPU::get_timing(op1, op2);
     }
 
-    fn adc(&mut self, op1: Operand, op2: Operand) {
+    pub(crate) fn adc(&mut self, op1: Operand, op2: Operand) {
         let value1: u8 = self.get_operand_as_u8(op1);
         let value2: u8 = self.get_operand_as_u8(op2);
         let carry_in: u8 = self.registers.get_flag(CARRY) as u8;
@@ -296,10 +225,9 @@ impl CPU {
         let carry: bool = carry1 || carry2;
         let half_carry = ((value1 & 0xF) + (value2 & 0xF) + carry_in) > 0xF;
         self.update_flags(result == 0, false, half_carry, carry);
-        self.clock += CPU::get_timing(op1, op2);
     }
 
-    fn sbc(&mut self, op1: Operand, op2: Operand) {
+    pub(crate) fn sbc(&mut self, op1: Operand, op2: Operand) {
         let value1: u8 = self.get_operand_as_u8(op1);
         let value2: u8 = self.get_operand_as_u8(op2);
         let carry_in: u8 = self.registers.get_flag(CARRY) as u8;
@@ -314,7 +242,7 @@ impl CPU {
         self.update_flags(result == 0, true, half_carry, borrow);
     }
 
-    fn inc(&mut self, op1: Operand) {
+    pub(crate) fn inc(&mut self, op1: Operand) {
         let value: u8 = self.get_operand_as_u8(op1);
         let (result, overflowed) = value.overflowing_add(1);
 
@@ -324,12 +252,9 @@ impl CPU {
         let half_carry: bool = ((value & 0xF) + (1 & 0xF)) > 0xF;
         let carry: bool = self.registers.get_flag(CARRY);
         self.update_flags(result == 0, false, half_carry, carry);
-
-        //TODO: This doesn't properly work
-        self.clock += CPU::get_timing(op1, Imm8);
     }
 
-    fn sub(&mut self, op1: Operand, op2: Operand) {
+    pub(crate) fn sub(&mut self, op1: Operand, op2: Operand) {
         let value1: u8 = self.get_operand_as_u8(op1);
         let value2: u8 = self.get_operand_as_u8(op2);
         let (result, overflowed) = value1.overflowing_sub(value2);
@@ -339,10 +264,9 @@ impl CPU {
 
         let half_carry: bool = (value1 & 0xF) < (value2 & 0xF);
         self.update_flags(result == 0, true, half_carry, overflowed);
-        self.clock += CPU::get_timing(op1, op2);
     }
 
-    fn dec(&mut self, op1: Operand) {
+    pub(crate) fn dec(&mut self, op1: Operand) {
         let value: u8 = self.get_operand_as_u8(op1);
         let (result, overflowed) = value.overflowing_sub(1);
 
@@ -351,12 +275,9 @@ impl CPU {
         let half_carry: bool = (value & 0xF) < (1 & 0xF);
         let keep_carry: bool = self.registers.get_flag(CARRY);
         self.update_flags(result == 0, true, half_carry, keep_carry);
-        //TODO: This doesn't properly work
-        //move this to an outer structure!!!!!!! Fetch, decode, execute
-        self.clock += CPU::get_timing(op1, Imm8);
     }
 
-    fn and(&mut self, source: Operand, op: Operand) {
+    pub(crate) fn and(&mut self, source: Operand, op: Operand) {
         let register_value = self.get_operand_as_u8(source);
         let result: u8 = register_value & self.get_operand_as_u8(op);
 
@@ -364,7 +285,7 @@ impl CPU {
         self.update_flags(result == 0, false, false, false);
     }
 
-    fn or(&mut self, source: Operand, op: Operand) {
+    pub(crate) fn or(&mut self, source: Operand, op: Operand) {
         let register_value = self.get_operand_as_u8(source);
         let result: u8 = register_value | self.get_operand_as_u8(op);
 
@@ -372,7 +293,7 @@ impl CPU {
         self.update_flags(result == 0, false, false, false);
     }
 
-    fn xor(&mut self, source: Operand, op: Operand) {
+    pub(crate) fn xor(&mut self, source: Operand, op: Operand) {
         let register_value = self.get_operand_as_u8(source);
         let result: u8 = register_value ^ self.get_operand_as_u8(op);
         self.set_operand_from_u8(source, result);
@@ -380,7 +301,7 @@ impl CPU {
         self.update_flags(result == 0, false, false, false);
     }
 
-    fn cp(&mut self, source: Operand, op: Operand) {
+    pub(crate) fn cp(&mut self, source: Operand, op: Operand) {
         let register_value = self.get_operand_as_u8(source);
         let to_sub: u8 = self.get_operand_as_u8(op);
 
@@ -391,19 +312,17 @@ impl CPU {
     }
 
     // ============= reg16 Arithmetic =============
-    fn inc_u16(&mut self, op: Operand) {
+    pub(crate) fn inc_u16(&mut self, op: Operand) {
         let value = self.get_operand_as_u16(op);
         self.set_operand_to_u16(op, value + 1);
-        self.clock += 8;
     }
 
-    fn dec_u16(&mut self, op: Operand) {
+    pub(crate) fn dec_u16(&mut self, op: Operand) {
         let value = self.get_operand_as_u16(op);
         self.set_operand_to_u16(op, value - 1);
-        self.clock += 8;
     }
 
-    fn add_hl_rr(&mut self, src: Operand) {
+    pub(crate) fn add_hl_rr(&mut self, src: Operand) {
         let hl = self.registers.get_16register(Reg16::HL);
         let value = self.get_operand_as_u16(src);
 
@@ -411,13 +330,10 @@ impl CPU {
         let half_carry = ((hl & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF;
 
         self.registers.set_16register(Reg16::HL, result);
-
         self.update_flags(self.registers.get_flag(ZERO), false, half_carry, carry);
-
-        self.clock += 8;
     }
 
-    fn add_sp_e8(&mut self) {
+    pub(crate) fn add_sp_e8(&mut self) {
         let sp = self.registers.get_16register(Reg16::SP);
         let offset = self.get_operand_as_u8(Operand::Imm8) as i8 as i16; // signed immediate
 
@@ -428,13 +344,11 @@ impl CPU {
 
         self.registers.set_16register(Reg16::SP, result);
         self.update_flags(false, false, half_carry, carry);
-
-        self.clock += 16;
     }
 
     // ============= Jumps and Calls =============
 
-    fn jr(&mut self, condition: Operand, op: Operand) {
+    pub(crate) fn jr(&mut self, condition: Operand, op: Operand) {
         let offset = self.get_operand_as_u8(op) as i8;
 
         if self.check_condition(condition) {
@@ -448,17 +362,21 @@ impl CPU {
         }
     }
 
-    fn jp(&mut self, condition: Operand, address: Operand) {
+    pub(crate) fn jp(&mut self, condition: Operand, address: Operand) {
         let address = self.get_operand_as_u16(address);
         if self.check_condition(condition) {
             self.registers.set_16register(PC, address);
-            self.clock += 16;
+            if matches!(R16(HL),address){
+                self.clock += 4;
+            } else {
+                self.clock += 16;
+            }
         } else {
             self.clock += 12;
         }
     }
 
-    fn call(&mut self, condition: Operand, address_operand: Operand) {
+    pub(crate) fn call(&mut self, condition: Operand, address_operand: Operand) {
         let addr = self.get_operand_as_u16(address_operand);
         if self.check_condition(condition) {
             let pc = self.registers.get_16register(PC);
@@ -478,7 +396,7 @@ impl CPU {
         }
     }
 
-    fn rst(&mut self, address: Operand) {
+    pub(crate) fn rst(&mut self, address: Operand) {
         //This func is very similar to call
         let address_value = self.get_operand_as_u16(address);
         let pc = self.registers.get_16register(PC);
@@ -491,50 +409,51 @@ impl CPU {
         self.registers.set_16register(SP, sp);
 
         self.registers.set_16register(PC, address_value as u16);
-
-        self.clock += 16;
     }
 
-    fn ret(&mut self, condition: Operand) {
+    pub(crate) fn ret(&mut self, condition: Operand) {
         if self.check_condition(condition) {
-            let sp = self.registers.get_16register(SP);
+            let mut sp = self.registers.get_16register(SP);
             //Not sure of ordering here, is the stack little or big endian?
             let lsb = self.bus.read(sp);
-            let msb = self.bus.read(sp + 1);
+            sp = sp.wrapping_add(1);
+            let msb = self.bus.read(sp);
+            sp = sp.wrapping_add(1);
 
-            if let Operand::Flag(None) = condition {
+            let address = CPU::fuse_u8(lsb, msb);
+            self.registers.set_16register(SP,sp);
+            self.registers.set_16register(PC,address);
+
+            if matches!(Operand::Flag(None), condition) {
                 self.clock += 16;
             } else {
-                self.clock += 16;
+                self.clock += 20;
             }
         } else {
             self.clock += 8;
         }
     }
 
-    fn reti(&mut self) {
+    pub(crate) fn reti(&mut self) {
         self.ret(Flag(None));
         self.ei();
-        self.clock -= 4; // To remove extra 4 ticks from ei
     }
 
-    fn push(&mut self, op: Operand) {
+    pub(crate) fn push(&mut self, op: Operand) {
         let value = self.get_operand_as_u16(op);
         let (lsb, msb) = CPU::split_u16(value);
 
         let mut sp = self.registers.get_16register(SP);
 
-        self.bus.write(sp, lsb);
-        sp = sp.wrapping_sub(1);
         self.bus.write(sp, msb);
+        sp = sp.wrapping_sub(1);
+        self.bus.write(sp, lsb);
         sp = sp.wrapping_sub(1);
 
         self.registers.set_16register(SP, sp);
-
-        self.clock += 16;
     }
 
-    fn pop(&mut self, op: Operand) {
+    pub(crate) fn pop(&mut self, op: Operand) {
         let mut sp = self.registers.get_16register(SP);
 
         let lsb = self.bus.read(sp);
@@ -550,30 +469,25 @@ impl CPU {
 
         self.set_operand_to_u16(op, value);
         self.registers.set_16register(SP, sp);
-        self.clock += 12;
     }
 
     // ============= Interrupts and Misc =============
 
-    fn ei(&mut self) {
+    pub(crate) fn ei(&mut self) {
         self.ime_pending = true;
-        self.clock += 4;
     }
 
-    fn di(&mut self) {
+    pub(crate) fn di(&mut self) {
         self.ime = false; // Immediately disable interrupts
         self.ime_pending = false; // Make sure no pending enable remains
-        self.clock += 4; // 1 machine cycle
     }
 
-    fn nop(&mut self) {
-        self.clock = 4;
+    pub(crate) fn nop(&mut self) {
     }
 
-    fn halt(&mut self) {
+    pub(crate) fn halt(&mut self) {
         self.halted = true;
-        self.clock += 4; // HALT instruction takes 4 cycles
-        
+
         /*
 
         FOR FUTURE ME:
@@ -595,33 +509,44 @@ impl CPU {
     }
 
     //set carry flag
-    fn scf(&mut self) {
+    pub(crate) fn scf(&mut self) {
         let zero = self.registers.get_flag(ZERO);
         self.update_flags(zero, false, false, true);
-        self.clock += 4;
     }
 
     //complement carry flag
-    fn ccf(&mut self) {
+    pub(crate) fn ccf(&mut self) {
         let zero = self.registers.get_flag(ZERO);
         let carry = self.registers.get_flag(CARRY);
         self.update_flags(zero, false, false, !carry);
-        self.clock += 4;
     }
 
-    fn cpl(&mut self) {
+    pub(crate) fn cpl(&mut self) {
         let a = self.registers.get_u8register(Reg8::A);
         let result = !a;
 
         self.registers.set_u8register(Reg8::A, result);
         self.registers.set_flag(SUBSTRACTION, true);
         self.registers.set_flag(HALFCARRY, true);
-
-        self.clock += 4; // CPL instruction takes 1 machine cycle (4 t-states)
     }
 
-    fn stop(&mut self, op: Operand) {
-        self.clock = 4;
+    pub(crate) fn daa(&mut self) {
+        panic!("TODO")
+    }
+    pub(crate) fn rlca(&mut self) {
+        panic!("TODO")
+    }
+    pub(crate) fn rla(&mut self) {
+        panic!("TODO")
+    }
+    pub(crate) fn rrca(&mut self) {
+        panic!("TODO")
+    }
+    pub(crate) fn rra(&mut self) {
+        panic!("TODO")
+    }
+
+    pub(crate) fn stop(&mut self, op: Operand) {
         panic!("Is STOP really needed?");
         //This has some weird hardware behavior
         //Chek a lot of documentation if implemented in future!
@@ -634,27 +559,120 @@ impl CPU {
         }
     }
 
-    //TODO: Implement RST with MemAdress, add an extra field, Fixed
-
     // ==================== ENDOF NEW AND IMPROVED FUNCS ====================
 
     // $CB Prefixed
 
-    fn rlc(&mut self, op: Operand) {}
-    fn rrc(&mut self, op: Operand) {}
+    //rorates r in cirular manner to the left,7bit is copied to 0 and carry
+    pub(crate) fn rlc(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let msb = value >>7;
+        let result = (value << 1) | msb;  
 
-    fn rl(&mut self, op: Operand) {}
-    fn rr(&mut self, op: Operand) {}
+        self.set_operand_from_u8(op,result);
+        self.update_flags(result == 0, false, false, msb == 1);
+    } 
 
-    fn sla(&mut self, op: Operand) {}
-    fn sra(&mut self, op: Operand) {}
+    pub(crate) fn rrc(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let lsb = value & 1;
+        let result = (value >> 1) | ( lsb << 7);
 
-    fn swap(&mut self, op: Operand) {}
-    fn srl(&mut self, op: Operand) {}
+        self.set_operand_from_u8(op,result);
+        self.update_flags(result == 0, false, false, lsb == 1);
+    } 
 
-    fn bit(&mut self, op: Operand, reg_index: Operand) {}
-    fn res(&mut self, op: Operand, reg_index: Operand) {}
-    fn set(&mut self, op: Operand, reg_index: Operand) {}
+    // shift to the left, but discard to carry, and use carry to fill
+    pub(crate) fn rl(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let carry = self.registers.get_flag(CARRY) as u8;
+        let msb = value >>7;
+        let result = (value << 1) | carry;
+
+        self.set_operand_from_u8(op,result);
+        self.update_flags(result == 0 , false, false, msb == 1 )
+    }
+
+    pub(crate) fn rr(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let carry = self.registers.get_flag(CARRY) as u8;
+        let lsb = value & 1;
+        let result = (value >> 1) | (carry << 7);
+
+        self.set_operand_from_u8(op,result);
+        self.update_flags(result == 0 , false, false, lsb == 1 );
+    }
+
+    // same as rl but instead place 0 in the made gap
+    pub(crate) fn sla(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let msb = value >> 7;
+        let result = value << 1;
+
+        self.set_operand_from_u8(op,result);
+        self.update_flags(result == 0 , false, false, msb == 1 )
+
+    }
+    pub(crate) fn sra(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let msb = value >> 7;
+        let lsb = value & 1;
+
+        //not certain about this special case
+        let result = if matches!(op,Address(AddrR16(HL))){
+            value >> 1
+        }else{
+            value >> 1 | (msb << 7)
+        };
+
+        self.set_operand_from_u8(op,result);
+        self.update_flags(result == 0 , false, false, lsb == 1 )
+
+    }
+
+    pub(crate) fn swap(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let result = (value >> 4) | (value << 4);
+        self.set_operand_from_u8(op, result);
+        self.update_flags(result == 0, false, false,false);
+    }
+
+    pub(crate) fn srl(&mut self, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let lsb = value & 1;
+        let result = value >> 1;
+
+        self.set_operand_from_u8(op, result);
+        self.update_flags(result == 0, false, false, lsb ==1);
+
+    }
+
+    pub(crate) fn bit(&mut self, bit_idx: Operand, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let bit_index = self.get_operand_as_u8(bit_idx);
+        
+        let bit_is_0 = (value >> bit_index ) & 1 == 0; 
+        self.registers.set_flag(ZERO, bit_is_0);
+        self.registers.set_flag(SUBSTRACTION, false);
+        self.registers.set_flag(HALFCARRY, true);
+    } 
+
+    pub(crate) fn res(&mut self, bit_idx: Operand, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let bit_index = self.get_operand_as_u8(bit_idx);
+        
+        let result = value & !(1 << bit_index); 
+        self.set_operand_from_u8(op, result);
+ 
+    } //set nth bit to 0 
+    pub(crate) fn set(&mut self, bit_idx: Operand, op: Operand) {
+        let value = self.get_operand_as_u8(op);
+        let bit_index = self.get_operand_as_u8(bit_idx);
+        
+        let result = value | (1 << bit_index); 
+        self.set_operand_from_u8(op, result);
+ 
+    } 
 }
 
 // ================================== REGISTERS =============================
@@ -673,8 +691,13 @@ pub struct Registers {
 }
 
 impl Registers {
+    //Think about maybe using #[inline(always)]
     fn set_flag(&mut self, bit_idx: u8, flag: bool) {
-        self.f = self.f | ((flag as u8) << bit_idx) //Bitwise or 
+        if flag {
+            self.f = self.f | ((flag as u8) << bit_idx); //Bitwise or 
+        } else {
+            self.f = self.f & !(1 << bit_idx);
+        }
     }
 
     fn get_flag(&self, bit_idx: u8) -> bool {
@@ -708,7 +731,10 @@ impl Registers {
         match register {
             Reg16::SP => self.sp = value,
             Reg16::PC => self.pc = value,
-            Reg16::AF => set_registers(&mut self.a, &mut self.f, value),
+            Reg16::AF => {
+                self.a = (value >> 8) as u8;
+                self.f = (value & 0xF0) as u8;
+            },
             Reg16::BC => set_registers(&mut self.b, &mut self.c, value),
             Reg16::DE => set_registers(&mut self.d, &mut self.e, value),
             Reg16::HL => set_registers(&mut self.h, &mut self.l, value),
