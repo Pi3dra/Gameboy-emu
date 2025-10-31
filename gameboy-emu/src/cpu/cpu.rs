@@ -5,6 +5,8 @@ const HALFCARRY: u8 = 5; //H
 const CARRY: u8 = 4; //C
 
 use super::{FlagCondition, MemAdress, Operand, Reg8, Reg16};
+use crate::cpu::opcodes::InstrPointer;
+use std::fmt;
 
 // ================================== CPU =============================
 
@@ -12,10 +14,28 @@ use super::{FlagCondition, MemAdress, Operand, Reg8, Reg16};
 pub struct CPU {
     registers: Registers,
     bus: Memory,
-    clock: u16,
+    clock: u64,
     ime: bool,         // Interrupt Master Enable
     ime_pending: bool, // For delayed EI
     halted: bool,
+    opcode_table: [InstrPointer; 256],
+    cb_table: [InstrPointer; 256],
+    //for debug purposes
+    executing: (u8, InstrPointer),
+}
+
+impl fmt::Debug for CPU {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CPU State before crash:\n\
+             Executing opcode: 0x{:02X}\n\
+             Instruction: {:?}\n\
+             Clock: {}\n\
+             Halted: {}",
+            self.executing.0, self.executing.1, self.clock, self.halted
+        )
+    }
 }
 
 use FlagCondition::*;
@@ -23,6 +43,95 @@ use MemAdress::*;
 use Operand::*;
 use Reg16::*;
 impl CPU {
+    pub fn new(rom: Vec<u8>) -> Self {
+        let bus = Memory::new(rom.clone());
+        let (opcode_table, cb_table) = CPU::build_table();
+
+        //Blarg tests supposes that we start after BIOS exec
+        let registers = Registers {
+            a: 0x01,
+            f: 0xB0,
+            b: 0x00,
+            c: 0x13,
+            d: 0x00,
+            e: 0xD8,
+            h: 0x01,
+            l: 0x4D,
+            sp: 0xFFFE,
+            pc: 0x0100,
+        };
+
+        let executing = (0, InstrPointer::None);
+
+        CPU {
+            registers,
+            bus,
+            clock: 0,
+            ime: false,
+            ime_pending: false,
+            halted: false,
+            opcode_table,
+            cb_table,
+            executing,
+        }
+    }
+
+    pub fn step(&mut self) {
+        if self.halted {
+            if self.ime_pending {
+                self.halted = false;
+            } else {
+                self.clock = self.clock.wrapping_add(4);
+                return;
+            }
+        }
+
+        let pc = self.registers.get_16register(PC);
+        println!();
+        let opcode = self.bus.read(pc);
+        self.registers.pc = pc.wrapping_add(1);
+
+        if opcode == 0xCB {
+            println!();
+            let opcode2 = self.bus.read(self.registers.pc);
+            self.registers.pc = pc.wrapping_add(1);
+            self.execute_from_instr(self.cb_table[opcode2 as usize], opcode2);
+        } else {
+            self.execute_from_instr(self.opcode_table[opcode as usize], opcode);
+        }
+    }
+
+    pub fn run(&mut self) {
+        loop {
+            self.step();
+            // Optional: safety cutoff to prevent infinite loops
+            if self.clock > 50_000_000 {
+              println!("❌ Timeout or infinite loop. Test failed or hanging.");
+               break;
+            }
+        }
+    }
+
+    fn execute_from_instr(&mut self, instr: InstrPointer, opcode: u8) {
+        self.executing = (opcode, instr);
+        println!("\n0x{:02X} {:<20} === pc: 0x{:04X}", opcode, instr, self.registers.pc);
+        match instr {
+            InstrPointer::Const(func, cycles) => {
+                func(self);
+                self.clock = self.clock.wrapping_add(cycles as u64);
+            }
+            InstrPointer::Unop(func, op, cycles) => {
+                func(self, op);
+                self.clock = self.clock.wrapping_add(cycles as u64);
+            }
+            InstrPointer::Binop(func, op1, op2, cycles) => {
+                func(self, op1, op2);
+                self.clock = self.clock.wrapping_add(cycles as u64);
+            }
+            InstrPointer::None => panic!("Unimplemented opcode \n{:?}", self),
+        }
+    }
+
     fn check_condition(&mut self, op: Operand) -> bool {
         match op {
             Flag(NZ) => return !self.registers.get_flag(ZERO),
@@ -75,9 +184,10 @@ impl CPU {
                 let address = 0xFF00u16 + offset as u16;
                 return self.bus.read(address);
             }
+            Value(n) => n as u8,
 
             //Address(Imm8) -> Do thhis
-            _ => panic!("not a u8 operand!"),
+            _ => panic!("not a u8 operand for get! {:?}", self),
         }
     }
 
@@ -117,7 +227,7 @@ impl CPU {
                 self.bus.write(address, value)
             }
 
-            _ => panic!("not a u8 operand!"),
+            _ => panic!("not a u8 operand for set! {:?}", self),
         }
     }
 
@@ -125,17 +235,17 @@ impl CPU {
         match op {
             R16(register) => return self.registers.set_16register(register, value),
             Address(ImmAddr16) => {
-                let (vlsb, vmsb) = CPU::split_u16(value);
 
                 let lsb = self.get_operand_as_u8(Imm8);
                 let msb = self.get_operand_as_u8(Imm8);
 
                 let address = CPU::fuse_u8(lsb, msb);
+                let (vlsb, vmsb) = CPU::split_u16(value);
                 self.bus.write(address, vlsb);
                 self.bus.write(address + 1, vmsb);
             }
 
-            _ => panic!("not a u16 operand!"),
+            _ => panic!("not a u16 operand for set \n {:?}!", self),
         }
     }
 
@@ -149,7 +259,7 @@ impl CPU {
             }
             Address(Fixed(value)) => return value,
             Value(value) => return value,
-            _ => panic!("not a u16 operand!"),
+            _ => panic!("not a u16 operand for get! \n {:?}", self),
         }
     }
 
@@ -349,16 +459,15 @@ impl CPU {
     // ============= Jumps and Calls =============
 
     pub(crate) fn jr(&mut self, condition: Operand, op: Operand) {
-        let offset = self.get_operand_as_u8(op) as i8;
-
+        let offset = self.get_operand_as_u8(op) as i8 as i16;
         if self.check_condition(condition) {
             let pc: u16 = self.registers.get_16register(PC);
             //Not really sure this offset works?
             self.registers
-                .set_16register(PC, pc.wrapping_add(offset as u16));
-            self.clock += 12;
+                .set_16register(PC, (pc as i16).wrapping_add(offset) as u16);
+            self.clock = self.clock.wrapping_add(12 as u64);
         } else {
-            self.clock += 8;
+            self.clock = self.clock.wrapping_add(8 as u64);
         }
     }
 
@@ -366,13 +475,13 @@ impl CPU {
         let address = self.get_operand_as_u16(address);
         if self.check_condition(condition) {
             self.registers.set_16register(PC, address);
-            if matches!(R16(HL),address){
-                self.clock += 4;
+            if matches!(R16(HL), address) {
+                self.clock = self.clock.wrapping_add(4);
             } else {
-                self.clock += 16;
+                self.clock = self.clock.wrapping_add(16);
             }
         } else {
-            self.clock += 12;
+            self.clock = self.clock.wrapping_add(12 as u64);
         }
     }
 
@@ -380,19 +489,19 @@ impl CPU {
         let addr = self.get_operand_as_u16(address_operand);
         if self.check_condition(condition) {
             let pc = self.registers.get_16register(PC);
-
             let mut sp = self.registers.get_16register(SP);
+
             sp = sp.wrapping_sub(1);
-            self.bus.write(sp, (pc >> 8) as u8); // MSB
+            self.bus.write(sp, (pc & 0xFF) as u8); // LSB
             sp = sp.wrapping_sub(1);
-            self.bus.write(sp, pc as u8); // LSB
+            self.bus.write(sp, (pc >> 8) as u8); // LSB
             self.registers.set_16register(SP, sp);
 
             self.registers.set_16register(PC, addr);
 
-            self.clock += 24;
+            self.clock = self.clock.wrapping_add(24 as u64);
         } else {
-            self.clock += 12;
+            self.clock = self.clock.wrapping_add(12 as u64);
         }
     }
 
@@ -421,16 +530,17 @@ impl CPU {
             sp = sp.wrapping_add(1);
 
             let address = CPU::fuse_u8(lsb, msb);
-            self.registers.set_16register(SP,sp);
-            self.registers.set_16register(PC,address);
+            self.registers.set_16register(SP, sp);
+            self.registers.set_16register(PC, address);
 
             if matches!(Operand::Flag(None), condition) {
+                self.clock = self.clock.wrapping_add(16 as u64);
                 self.clock += 16;
             } else {
-                self.clock += 20;
+                self.clock = self.clock.wrapping_add(20 as u64);
             }
         } else {
-            self.clock += 8;
+            self.clock = self.clock.wrapping_add(8 as u64);
         }
     }
 
@@ -445,10 +555,10 @@ impl CPU {
 
         let mut sp = self.registers.get_16register(SP);
 
+        sp = sp.wrapping_sub(1);
         self.bus.write(sp, msb);
         sp = sp.wrapping_sub(1);
         self.bus.write(sp, lsb);
-        sp = sp.wrapping_sub(1);
 
         self.registers.set_16register(SP, sp);
     }
@@ -456,10 +566,10 @@ impl CPU {
     pub(crate) fn pop(&mut self, op: Operand) {
         let mut sp = self.registers.get_16register(SP);
 
-        let lsb = self.bus.read(sp);
         sp = sp.wrapping_add(1);
         let msb = self.bus.read(sp);
         sp = sp.wrapping_add(1);
+        let lsb = self.bus.read(sp);
         let mut value = CPU::fuse_u8(lsb, msb);
 
         // Special handling for AF: lower nibble of F must be 0
@@ -482,8 +592,7 @@ impl CPU {
         self.ime_pending = false; // Make sure no pending enable remains
     }
 
-    pub(crate) fn nop(&mut self) {
-    }
+    pub(crate) fn nop(&mut self) {}
 
     pub(crate) fn halt(&mut self) {
         self.halted = true;
@@ -531,20 +640,57 @@ impl CPU {
     }
 
     pub(crate) fn daa(&mut self) {
-        panic!("TODO")
+    let mut a = self.registers.a;
+    let mut adjust = 0u8;
+
+    if !self.registers.get_flag(SUBSTRACTION) {
+        if self.registers.get_flag(HALFCARRY) || (a & 0x0F) > 9 {
+            adjust |= 0x06;
+        }
+        if self.registers.get_flag(CARRY) || a > 0x99 {
+            adjust |= 0x60;
+            self.registers.set_flag(CARRY, true);
+        }
+        a = a.wrapping_add(adjust);
+    } else {
+        if self.registers.get_flag(HALFCARRY) {
+            adjust |= 0x06;
+        }
+        if self.registers.get_flag(CARRY){
+            adjust |= 0x60;
+        }
+        a = a.wrapping_sub(adjust);
     }
+
+    self.registers.set_flag(ZERO, a == 0);
+    self.registers.a = a;
+    self.registers.set_flag(HALFCARRY,false);
+    }
+
     pub(crate) fn rlca(&mut self) {
-        panic!("TODO")
+        self.rlc(R8(Reg8::A));
+        self.clock = self.clock.wrapping_sub(4);
+        let keep_carry = self.registers.get_flag(CARRY);
+        self.update_flags(false, false, false, keep_carry);
     }
     pub(crate) fn rla(&mut self) {
-        panic!("TODO")
+        self.rl(R8(Reg8::A));
+        self.clock = self.clock.wrapping_sub(4);
+        let keep_carry = self.registers.get_flag(CARRY);
+        self.update_flags(false, false, false, keep_carry);
     }
     pub(crate) fn rrca(&mut self) {
-        panic!("TODO")
-    }
+        self.rrc(R8(Reg8::A));
+        self.clock = self.clock.wrapping_sub(4);
+        let keep_carry = self.registers.get_flag(CARRY);
+        self.update_flags(false, false, false, keep_carry);
+   }
     pub(crate) fn rra(&mut self) {
-        panic!("TODO")
-    }
+        self.rr(R8(Reg8::A));
+        self.clock = self.clock.wrapping_sub(4);
+        let keep_carry = self.registers.get_flag(CARRY);
+        self.update_flags(false, false, false, keep_carry);
+  }
 
     pub(crate) fn stop(&mut self, op: Operand) {
         panic!("Is STOP really needed?");
@@ -566,31 +712,31 @@ impl CPU {
     //rorates r in cirular manner to the left,7bit is copied to 0 and carry
     pub(crate) fn rlc(&mut self, op: Operand) {
         let value = self.get_operand_as_u8(op);
-        let msb = value >>7;
-        let result = (value << 1) | msb;  
+        let msb = value >> 7;
+        let result = (value << 1) | msb;
 
-        self.set_operand_from_u8(op,result);
+        self.set_operand_from_u8(op, result);
         self.update_flags(result == 0, false, false, msb == 1);
-    } 
+    }
 
     pub(crate) fn rrc(&mut self, op: Operand) {
         let value = self.get_operand_as_u8(op);
         let lsb = value & 1;
-        let result = (value >> 1) | ( lsb << 7);
+        let result = (value >> 1) | (lsb << 7);
 
-        self.set_operand_from_u8(op,result);
+        self.set_operand_from_u8(op, result);
         self.update_flags(result == 0, false, false, lsb == 1);
-    } 
+    }
 
     // shift to the left, but discard to carry, and use carry to fill
     pub(crate) fn rl(&mut self, op: Operand) {
         let value = self.get_operand_as_u8(op);
         let carry = self.registers.get_flag(CARRY) as u8;
-        let msb = value >>7;
+        let msb = value >> 7;
         let result = (value << 1) | carry;
 
-        self.set_operand_from_u8(op,result);
-        self.update_flags(result == 0 , false, false, msb == 1 )
+        self.set_operand_from_u8(op, result);
+        self.update_flags(result == 0, false, false, msb == 1)
     }
 
     pub(crate) fn rr(&mut self, op: Operand) {
@@ -599,8 +745,8 @@ impl CPU {
         let lsb = value & 1;
         let result = (value >> 1) | (carry << 7);
 
-        self.set_operand_from_u8(op,result);
-        self.update_flags(result == 0 , false, false, lsb == 1 );
+        self.set_operand_from_u8(op, result);
+        self.update_flags(result == 0, false, false, lsb == 1);
     }
 
     // same as rl but instead place 0 in the made gap
@@ -609,9 +755,8 @@ impl CPU {
         let msb = value >> 7;
         let result = value << 1;
 
-        self.set_operand_from_u8(op,result);
-        self.update_flags(result == 0 , false, false, msb == 1 )
-
+        self.set_operand_from_u8(op, result);
+        self.update_flags(result == 0, false, false, msb == 1)
     }
     pub(crate) fn sra(&mut self, op: Operand) {
         let value = self.get_operand_as_u8(op);
@@ -619,22 +764,21 @@ impl CPU {
         let lsb = value & 1;
 
         //not certain about this special case
-        let result = if matches!(op,Address(AddrR16(HL))){
+        let result = if matches!(op, Address(AddrR16(HL))) {
             value >> 1
-        }else{
+        } else {
             value >> 1 | (msb << 7)
         };
 
-        self.set_operand_from_u8(op,result);
-        self.update_flags(result == 0 , false, false, lsb == 1 )
-
+        self.set_operand_from_u8(op, result);
+        self.update_flags(result == 0, false, false, lsb == 1)
     }
 
     pub(crate) fn swap(&mut self, op: Operand) {
         let value = self.get_operand_as_u8(op);
         let result = (value >> 4) | (value << 4);
         self.set_operand_from_u8(op, result);
-        self.update_flags(result == 0, false, false,false);
+        self.update_flags(result == 0, false, false, false);
     }
 
     pub(crate) fn srl(&mut self, op: Operand) {
@@ -643,36 +787,33 @@ impl CPU {
         let result = value >> 1;
 
         self.set_operand_from_u8(op, result);
-        self.update_flags(result == 0, false, false, lsb ==1);
-
+        self.update_flags(result == 0, false, false, lsb == 1);
     }
 
     pub(crate) fn bit(&mut self, bit_idx: Operand, op: Operand) {
         let value = self.get_operand_as_u8(op);
         let bit_index = self.get_operand_as_u8(bit_idx);
-        
-        let bit_is_0 = (value >> bit_index ) & 1 == 0; 
+
+        let bit_is_0 = (value >> bit_index) & 1 == 0;
         self.registers.set_flag(ZERO, bit_is_0);
         self.registers.set_flag(SUBSTRACTION, false);
         self.registers.set_flag(HALFCARRY, true);
-    } 
+    }
 
     pub(crate) fn res(&mut self, bit_idx: Operand, op: Operand) {
         let value = self.get_operand_as_u8(op);
         let bit_index = self.get_operand_as_u8(bit_idx);
-        
-        let result = value & !(1 << bit_index); 
+
+        let result = value & !(1 << bit_index);
         self.set_operand_from_u8(op, result);
- 
     } //set nth bit to 0 
     pub(crate) fn set(&mut self, bit_idx: Operand, op: Operand) {
         let value = self.get_operand_as_u8(op);
         let bit_index = self.get_operand_as_u8(bit_idx);
-        
-        let result = value | (1 << bit_index); 
+
+        let result = value | (1 << bit_index);
         self.set_operand_from_u8(op, result);
- 
-    } 
+    }
 }
 
 // ================================== REGISTERS =============================
@@ -734,7 +875,7 @@ impl Registers {
             Reg16::AF => {
                 self.a = (value >> 8) as u8;
                 self.f = (value & 0xF0) as u8;
-            },
+            }
             Reg16::BC => set_registers(&mut self.b, &mut self.c, value),
             Reg16::DE => set_registers(&mut self.d, &mut self.e, value),
             Reg16::HL => set_registers(&mut self.h, &mut self.l, value),
@@ -788,17 +929,80 @@ struct Memory {
 }
 
 impl Memory {
+    pub fn check_serial(&mut self) -> Option<String> {
+        // Get the serial registers
+        let sb = self.io[0x01]; // 0xFF01: serial data (byte to send)
+        let sc = self.io[0x02]; // 0xFF02: serial control (start transfer if 0x81)
+
+        if sc == 0x81 {
+            // Blargg just requested a serial transfer
+            self.io[0x02] = 0; // emulate completion: clear "transfer in progress"
+            return Some((sb as char).to_string()); // return the output character
+        }
+
+        Option::None // nothing to print this step
+    }
+
+    pub fn new(rom: Vec<u8>) -> Self {
+        // Split ROM into 0x0000–0x3FFF (bank 0) and 0x4000–0x7FFF (bank 1)
+        let mut rom0 = [0u8; 0x4000];
+        let mut romn = [0u8; 0x4000];
+
+        for (i, byte) in rom.iter().enumerate() {
+            if i < 0x4000 {
+                rom0[i] = *byte;
+            } else if i < 0x8000 {
+                romn[i - 0x4000] = *byte;
+            } else {
+                break; // ignore any extra bytes (Game Boy ROM limit per bank)
+            }
+        }
+
+        Self {
+            rom0,
+            romn,
+            vram: [0; 0x2000],
+            ram: [0; 0x2000],
+            wram1: [0; 0x1000],
+            wram2: [0; 0x1000],
+            oam: [0; 0xA0],
+            io: [0; 0x80],
+            hram: [0; 0x7F],
+            interrupt: [0; 1],
+        }
+    }
+
+    /*
     fn write(&mut self, address: u16, value: u8) {
         let (region, address, _, writable) = self.map(address);
 
         if writable {
             region[address] = value;
         }
+    }*/
+    fn write(&mut self, address: u16, value: u8) {
+    // Handle serial transfer for Blargg tests
+    if address == 0xFF02 && value == 0x81 {
+        // Blargg requested a transfer
+        let c = self.io[0x01] as char; // Read the byte to send
+        print!("{}", c);               // Print immediately
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        self.io[0x02] = 0; // Clear "transfer in progress" flag
+        return;            // Do not write to underlying memory, optional
     }
+
+    let (region, address, _, writable) = self.map(address);
+
+    if writable {
+        region[address] = value;
+    }
+}
+
 
     fn read(&mut self, address: u16) -> u8 {
         let (region, address, readable, _) = self.map(address);
 
+        println!("R: addr: 0x{:04X}, value: 0x{:02X}", address , region[address]);
         if readable {
             return region[address];
         }
@@ -806,25 +1010,29 @@ impl Memory {
         0xFF
     }
 
-    fn map(&mut self, adress: u16) -> (&mut [u8], usize, bool, bool) {
-        match adress {
-            0x0000..=0x3FFF => (&mut self.rom0, adress as usize, true, false),
-            0x4000..=0x7FFF => (&mut self.romn, (adress - 0x4000) as usize, true, false),
+    fn map(&mut self, address: u16) -> (&mut [u8], usize, bool, bool) {
+        match address {
+            0x0000..=0x3FFF => (&mut self.rom0, address as usize, true, false),
+            0x4000..=0x7FFF => (&mut self.romn, (address - 0x4000) as usize, true, false),
 
-            0x8000..=0x9FFF => (&mut self.vram, (adress - 0x8000) as usize, true, true),
-            0xA000..=0xBFFF => (&mut self.ram, (adress - 0xA000) as usize, true, true),
+            0x8000..=0x9FFF => (&mut self.vram, (address - 0x8000) as usize, true, true),
+            0xA000..=0xBFFF => (&mut self.ram, (address - 0xA000) as usize, true, true),
 
-            0xC000..=0xCFFF => (&mut self.wram1, (adress - 0xC000) as usize, true, true),
-            0xD000..=0xDFFF => (&mut self.wram2, (adress - 0xD000) as usize, true, true),
+            0xC000..=0xCFFF => (&mut self.wram1, (address - 0xC000) as usize, true, true),
+            0xD000..=0xDFFF => (&mut self.wram2, (address - 0xD000) as usize, true, true),
 
-            0xFE00..=0xFE9F => (&mut self.oam, (adress - 0xFE00) as usize, true, true),
-            0xFF00..=0xFF7F => (&mut self.io, (adress - 0xFF00) as usize, true, true),
-            0xFF80..=0xFFFE => (&mut self.hram, (adress - 0xFF80) as usize, true, true),
+            // Echo RAM mirrors C000–DDFF
+            0xE000..=0xEFFF => (&mut self.wram1, (address - 0xE000) as usize, true, true),
+            0xF000..=0xFDFF => (&mut self.wram2, (address - 0xF000) as usize, true, true),
 
-            0xFFFF..=0xFFFF => (&mut self.interrupt, 0, true, true),
+            0xFE00..=0xFE9F => (&mut self.oam, (address - 0xFE00) as usize, true, true),
+            0xFEA0..=0xFEFF => (&mut self.oam, 0, false, false), // not usable; return dummy
 
-            0xE000..=0xFDFF => panic!("Echo RAM not implemented"),
-            0xFEA0..=0xFEFF => panic!("not usable memory"),
+            0xFF00..=0xFF7F => (&mut self.io, (address - 0xFF00) as usize, true, true),
+            0xFF80..=0xFFFE => (&mut self.hram, (address - 0xFF80) as usize, true, true),
+
+            0xFFFF => (&mut self.interrupt, 0, true, true),
+
         }
     }
 }
