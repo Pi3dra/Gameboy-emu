@@ -1,4 +1,7 @@
 #![allow(dead_code, unused_variables)]
+
+//Try this: https://robertheaton.com/gameboy-doctor/
+
 const ZERO: u8 = 7; //Z
 const SUBSTRACTION: u8 = 6; //N
 const HALFCARRY: u8 = 5; //H
@@ -24,28 +27,44 @@ pub struct CPU {
     executing: (u8, InstrPointer),
 }
 
-impl fmt::Debug for CPU {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "CPU State before crash:\n\
-             Executing opcode: 0x{:02X}\n\
-             Instruction: {:?}\n\
-             Clock: {}\n\
-             Halted: {}",
-            self.executing.0, self.executing.1, self.clock, self.halted
-        )
-    }
-}
-
 use FlagCondition::*;
 use MemAdress::*;
 use Operand::*;
 use Reg16::*;
 impl CPU {
+    pub fn print_state(&mut self) {
+        let pc_mem = [
+            self.bus.read(self.registers.pc),
+            self.bus.read(self.registers.pc.wrapping_add(1)),
+            self.bus.read(self.registers.pc.wrapping_add(2)),
+            self.bus.read(self.registers.pc.wrapping_add(3)),
+        ];
+
+        println!("A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
+            self.registers.a,
+            self.registers.f,
+            self.registers.b,
+            self.registers.c,
+            self.registers.d,
+            self.registers.e,
+            self.registers.h,
+            self.registers.l,
+            self.registers.sp,
+            self.registers.pc,
+            pc_mem[0],
+            pc_mem[1],
+            pc_mem[2],
+            pc_mem[3],
+        );
+    }
+    
+
+
     pub fn new(rom: Vec<u8>) -> Self {
         let bus = Memory::new(rom.clone());
         let (opcode_table, cb_table) = CPU::build_table();
+
+        println!{"{:?}",opcode_table[0x05]};
 
         //Blarg tests supposes that we start after BIOS exec
         let registers = Registers {
@@ -78,27 +97,29 @@ impl CPU {
 
     pub fn step(&mut self) {
         if self.halted {
-            if self.ime_pending {
+            if self.interrupt_pending() {
                 self.halted = false;
             } else {
                 self.clock = self.clock.wrapping_add(4);
-                return;
-            }
+            return;
+        }
         }
 
+        CPU::print_state(self);
         let pc = self.registers.get_16register(PC);
-        println!();
+        //println!();
         let opcode = self.bus.read(pc);
-        self.registers.pc = pc.wrapping_add(1);
 
         if opcode == 0xCB {
-            println!();
-            let opcode2 = self.bus.read(self.registers.pc);
-            self.registers.pc = pc.wrapping_add(1);
+            let opcode2 = self.bus.read(self.registers.pc.wrapping_add(1));
+            self.registers.pc = pc.wrapping_add(2);
             self.execute_from_instr(self.cb_table[opcode2 as usize], opcode2);
         } else {
+            self.registers.pc = pc.wrapping_add(1);
             self.execute_from_instr(self.opcode_table[opcode as usize], opcode);
         }
+        //println!("{:?}", self.registers)
+        self.update_ime();
     }
 
     pub fn run(&mut self) {
@@ -114,7 +135,7 @@ impl CPU {
 
     fn execute_from_instr(&mut self, instr: InstrPointer, opcode: u8) {
         self.executing = (opcode, instr);
-        println!("\n0x{:02X} {:<20} === pc: 0x{:04X}", opcode, instr, self.registers.pc);
+        //println!("\n0x{:02X} {:<20} === pc: 0x{:04X}", opcode, instr, self.registers.pc);
         match instr {
             InstrPointer::Const(func, cycles) => {
                 func(self);
@@ -128,7 +149,7 @@ impl CPU {
                 func(self, op1, op2);
                 self.clock = self.clock.wrapping_add(cycles as u64);
             }
-            InstrPointer::None => panic!("Unimplemented opcode \n{:?}", self),
+            InstrPointer::None => panic!("Unimplemented opcode"),
         }
     }
 
@@ -176,7 +197,7 @@ impl CPU {
             //For LDH func
             Address(ImmAddr8) => {
                 let offset = self.get_operand_as_u8(Imm8);
-                let address = 0xFF00u16 + offset as u16;
+                let address = CPU::fuse_u8(offset, 0xFF);
                 return self.bus.read(address);
             }
             Address(AddrR8(register)) => {
@@ -187,7 +208,7 @@ impl CPU {
             Value(n) => n as u8,
 
             //Address(Imm8) -> Do thhis
-            _ => panic!("not a u8 operand for get! {:?}", self),
+            _ => panic!("not a u8 operand for get!"),
         }
     }
 
@@ -227,7 +248,7 @@ impl CPU {
                 self.bus.write(address, value)
             }
 
-            _ => panic!("not a u8 operand for set! {:?}", self),
+            _ => panic!("not a u8 operand for set!"),
         }
     }
 
@@ -245,7 +266,7 @@ impl CPU {
                 self.bus.write(address + 1, vmsb);
             }
 
-            _ => panic!("not a u16 operand for set \n {:?}!", self),
+            _ => panic!("not a u16 operand for set"),
         }
     }
 
@@ -259,7 +280,7 @@ impl CPU {
             }
             Address(Fixed(value)) => return value,
             Value(value) => return value,
-            _ => panic!("not a u16 operand for get! \n {:?}", self),
+            _ => panic!("not a u16 operand for get! "),
         }
     }
 
@@ -322,34 +343,30 @@ impl CPU {
     }
 
     pub(crate) fn adc(&mut self, op1: Operand, op2: Operand) {
-        let value1: u8 = self.get_operand_as_u8(op1);
-        let value2: u8 = self.get_operand_as_u8(op2);
+        let a: u8 = self.get_operand_as_u8(op1);
+        let n: u8 = self.get_operand_as_u8(op2);
         let carry_in: u8 = self.registers.get_flag(CARRY) as u8;
 
-        let (intermediate, carry1) = value1.overflowing_add(value2);
-        let (result, carry2) = intermediate.overflowing_add(carry_in);
+        let sum16 = a as u16 + n as u16 + carry_in as u16;
+        let result = sum16 as u8;
+        let half_carry = ((a & 0xF) + (n & 0xF) + carry_in) > 0xF;
+        let carry = sum16 > 0xFF;
 
-        //Addition always stores back on a register
         self.set_operand_from_u8(op1, result);
-
-        let carry: bool = carry1 || carry2;
-        let half_carry = ((value1 & 0xF) + (value2 & 0xF) + carry_in) > 0xF;
         self.update_flags(result == 0, false, half_carry, carry);
     }
 
     pub(crate) fn sbc(&mut self, op1: Operand, op2: Operand) {
-        let value1: u8 = self.get_operand_as_u8(op1);
-        let value2: u8 = self.get_operand_as_u8(op2);
-        let carry_in: u8 = self.registers.get_flag(CARRY) as u8;
+        let a = self.get_operand_as_u8(op1);
+        let n = self.get_operand_as_u8(op2);
+        let carry_in = self.registers.get_flag(CARRY) as u8;
 
-        let (intermediate, borrow1) = value1.overflowing_sub(value2);
-        let (result, borrow2) = intermediate.overflowing_sub(carry_in);
-
-        let borrow = borrow1 || borrow2;
+        let result = a.wrapping_sub(n + carry_in);
+        let half_carry = (a & 0xF) < ((n & 0xF) + carry_in);
+        let carry = a < n + carry_in;
 
         self.set_operand_from_u8(op1, result);
-        let half_carry = (value1 & 0xF) < ((value2 & 0xF) + carry_in);
-        self.update_flags(result == 0, true, half_carry, borrow);
+        self.update_flags(result == 0, true, half_carry, carry);
     }
 
     pub(crate) fn inc(&mut self, op1: Operand) {
@@ -367,22 +384,23 @@ impl CPU {
     pub(crate) fn sub(&mut self, op1: Operand, op2: Operand) {
         let value1: u8 = self.get_operand_as_u8(op1);
         let value2: u8 = self.get_operand_as_u8(op2);
-        let (result, overflowed) = value1.overflowing_sub(value2);
+        let result = value1.wrapping_sub(value2);
 
         //Addition always stores back on a register
         self.set_operand_from_u8(op1, result);
 
         let half_carry: bool = (value1 & 0xF) < (value2 & 0xF);
-        self.update_flags(result == 0, true, half_carry, overflowed);
+        let c_flag = value1 < value2; // full-borrow
+        self.update_flags(result == 0, true, half_carry, c_flag);
     }
 
     pub(crate) fn dec(&mut self, op1: Operand) {
         let value: u8 = self.get_operand_as_u8(op1);
-        let (result, overflowed) = value.overflowing_sub(1);
+        let result = value.wrapping_sub(1);
 
         self.set_operand_from_u8(op1, result);
 
-        let half_carry: bool = (value & 0xF) < (1 & 0xF);
+        let half_carry: bool = (value & 0xF) == 0;
         let keep_carry: bool = self.registers.get_flag(CARRY);
         self.update_flags(result == 0, true, half_carry, keep_carry);
     }
@@ -392,7 +410,7 @@ impl CPU {
         let result: u8 = register_value & self.get_operand_as_u8(op);
 
         self.set_operand_from_u8(source, result);
-        self.update_flags(result == 0, false, false, false);
+        self.update_flags(result == 0, false, true, false);
     }
 
     pub(crate) fn or(&mut self, source: Operand, op: Operand) {
@@ -459,10 +477,11 @@ impl CPU {
     // ============= Jumps and Calls =============
 
     pub(crate) fn jr(&mut self, condition: Operand, op: Operand) {
+        // this increments PC
         let offset = self.get_operand_as_u8(op) as i8 as i16;
+
         if self.check_condition(condition) {
             let pc: u16 = self.registers.get_16register(PC);
-            //Not really sure this offset works?
             self.registers
                 .set_16register(PC, (pc as i16).wrapping_add(offset) as u16);
             self.clock = self.clock.wrapping_add(12 as u64);
@@ -491,12 +510,18 @@ impl CPU {
             let pc = self.registers.get_16register(PC);
             let mut sp = self.registers.get_16register(SP);
 
-            sp = sp.wrapping_sub(1);
-            self.bus.write(sp, (pc & 0xFF) as u8); // LSB
-            sp = sp.wrapping_sub(1);
-            self.bus.write(sp, (pc >> 8) as u8); // LSB
-            self.registers.set_16register(SP, sp);
+            //Address to jump to 
 
+            //storing PC in stack
+            let (lsb, msb) = CPU::split_u16(pc);
+
+            sp = sp.wrapping_sub(1);
+            self.bus.write(sp, msb); // LSB
+            sp = sp.wrapping_sub(1);
+            self.bus.write(sp, lsb); // MSB
+            
+            //updating registers accordingly
+            self.registers.set_16register(SP, sp);
             self.registers.set_16register(PC, addr);
 
             self.clock = self.clock.wrapping_add(24 as u64);
@@ -512,9 +537,9 @@ impl CPU {
 
         let mut sp = self.registers.get_16register(SP);
         sp = sp.wrapping_sub(1);
-        self.bus.write(sp, (pc >> 8) as u8); // MSB
-        sp = sp.wrapping_sub(1);
         self.bus.write(sp, pc as u8); // LSB
+        sp = sp.wrapping_sub(1);
+        self.bus.write(sp, (pc >> 8) as u8); // MSB
         self.registers.set_16register(SP, sp);
 
         self.registers.set_16register(PC, address_value as u16);
@@ -566,16 +591,13 @@ impl CPU {
     pub(crate) fn pop(&mut self, op: Operand) {
         let mut sp = self.registers.get_16register(SP);
 
+        let lsb = self.bus.read(sp);
         sp = sp.wrapping_add(1);
         let msb = self.bus.read(sp);
         sp = sp.wrapping_add(1);
-        let lsb = self.bus.read(sp);
-        let mut value = CPU::fuse_u8(lsb, msb);
 
-        // Special handling for AF: lower nibble of F must be 0
-        if let Operand::R16(Reg16::AF) = op {
-            value &= 0xFFF0;
-        }
+
+        let value = CPU::fuse_u8(lsb, msb);
 
         self.set_operand_to_u16(op, value);
         self.registers.set_16register(SP, sp);
@@ -693,7 +715,8 @@ impl CPU {
   }
 
     pub(crate) fn stop(&mut self, op: Operand) {
-        panic!("Is STOP really needed?");
+        //println!("STOP");
+        //panic!("Is STOP really needed?");
         //This has some weird hardware behavior
         //Chek a lot of documentation if implemented in future!
     }
@@ -705,6 +728,11 @@ impl CPU {
         }
     }
 
+    fn interrupt_pending(&mut self) -> bool {
+        let ie = self.bus.read(0xFFFF);
+        let iflag = self.bus.read(0xFF0F);
+        (ie & iflag) != 0
+    }
     // ==================== ENDOF NEW AND IMPROVED FUNCS ====================
 
     // $CB Prefixed
@@ -830,7 +858,14 @@ pub struct Registers {
     sp: u16, // Stack pointer
     pc: u16,
 }
-
+impl fmt::Debug for Registers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "A : 0x{:02X} F : 0x{:08b} \nB : 0x{:02X} C : 0x{:02X} \nD : 0x{:02X} E : 0x{:02X} \nH : 0x{:02X} L : 0x{:02X} \nSP : 0x{:04X} \nPC : 0x{:04X}", self. a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc
+        )
+    }
+}
 impl Registers {
     //Think about maybe using #[inline(always)]
     fn set_flag(&mut self, bit_idx: u8, flag: bool) {
@@ -862,19 +897,19 @@ impl Registers {
 
     fn set_16register(&mut self, register: Reg16, value: u16) {
         fn set_registers(reg1: &mut u8, reg2: &mut u8, value: u16) {
-            let high: u8 = (value >> 8) as u8;
-            let low: u8 = (value & 0xFF) as u8;
+            let (lsb,msb) = CPU::split_u16(value);
 
-            *reg1 = high;
-            *reg2 = low;
+            *reg1 = msb;
+            *reg2 = lsb;
         }
 
         match register {
             Reg16::SP => self.sp = value,
             Reg16::PC => self.pc = value,
             Reg16::AF => {
-                self.a = (value >> 8) as u8;
-                self.f = (value & 0xF0) as u8;
+                let (lsb, msb) = CPU::split_u16(value);
+                self.a = msb;
+                self.f = lsb & 0xF0;
             }
             Reg16::BC => set_registers(&mut self.b, &mut self.c, value),
             Reg16::DE => set_registers(&mut self.d, &mut self.e, value),
@@ -982,6 +1017,8 @@ impl Memory {
     }*/
     fn write(&mut self, address: u16, value: u8) {
     // Handle serial transfer for Blargg tests
+    
+    /*
     if address == 0xFF02 && value == 0x81 {
         // Blargg requested a transfer
         let c = self.io[0x01] as char; // Read the byte to send
@@ -989,7 +1026,7 @@ impl Memory {
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         self.io[0x02] = 0; // Clear "transfer in progress" flag
         return;            // Do not write to underlying memory, optional
-    }
+    }*/
 
     let (region, address, _, writable) = self.map(address);
 
@@ -1000,9 +1037,13 @@ impl Memory {
 
 
     fn read(&mut self, address: u16) -> u8 {
+        if address == 0xFF44 {
+            return 0x90 //for some gameboy-doctor tests
+        }
         let (region, address, readable, _) = self.map(address);
-
-        println!("R: addr: 0x{:04X}, value: 0x{:02X}", address , region[address]);
+        
+        
+        //println!("R: addr: 0x{:04X}, value: 0x{:02X}", address , region[address]);
         if readable {
             return region[address];
         }

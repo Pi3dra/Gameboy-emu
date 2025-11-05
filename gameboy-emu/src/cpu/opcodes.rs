@@ -19,9 +19,9 @@ use Reg16::*;
 impl std::fmt::Display for InstrPointer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstrPointer::Const(_, _) => write!(f, "Const"),
-            InstrPointer::Binop(_, dst, src, _) => write!(f, "Binop({:?}, {:?})", dst, src),
-            InstrPointer::Unop(_, reg, _) => write!(f, "Unop({:?})", reg),
+            InstrPointer::Const(_, _) => write!(f, ""),
+            InstrPointer::Binop(_, dst, src, _) => write!(f, "{:?}, {:?}", dst, src),
+            InstrPointer::Unop(_, reg, _) => write!(f, "{:?}", reg),
             InstrPointer::None => write!(f, "None"),
         }
     }
@@ -56,7 +56,6 @@ impl CPU {
         let dec = Unop(CPU::dec, R8(A), 0);
         CPU::init_instr(&mut table, inc, &order, &timing, 0x04, 0x8, false);
         CPU::init_instr(&mut table, dec, &order, &timing, 0x05, 0x8, false);
-        println!("inc dec r loaded!");
 
         //Add rr rr
         let timing2: [u16; 4] = [8, 8, 8, 8];
@@ -64,21 +63,18 @@ impl CPU {
         CPU::init_instr(
             &mut table, add_rr_rr, &rr_order, &timing2, 0x09, 0x10, false,
         );
-        println!("add rr rr loaded!");
 
         //Inc Dec rr
         let inc_rr = Unop(CPU::inc_u16, R8(A), 0);
         let dec_rr = Unop(CPU::dec_u16, R8(A), 0);
         CPU::init_instr(&mut table, inc_rr, &rr_order, &timing2, 0x03, 0x10, false);
         CPU::init_instr(&mut table, dec_rr, &rr_order, &timing2, 0x0B, 0x10, false);
-        println!("add rr rr loaded!");
 
         //LOADING
         //Ld r n8
         let timing3: [u16; 8] = [8, 8, 8, 8, 8, 8, 12, 8];
         let ld_r_n8 = Binop(CPU::ld_u8, R8(A), Imm8, 0);
         CPU::init_instr(&mut table, ld_r_n8, &order, &timing3, 0x06, 0x8, true);
-        println!("ld r n8 loaded!");
 
         //Ld a addr
         let mem_order: [Operand; 4] = [
@@ -91,7 +87,6 @@ impl CPU {
         CPU::init_instr(
             &mut table, ld_a_addr, &mem_order, &timing2, 0x0A, 0x10, false,
         );
-        println!("ld a addr loaded!");
 
         //Ld addr a
         let mem_order: [Operand; 4] = [
@@ -104,13 +99,11 @@ impl CPU {
         CPU::init_instr(
             &mut table, ld_addr_a, &mem_order, &timing2, 0x02, 0x10, true,
         );
-        println!("ld addr a loaded!");
 
         //Ld rr n16
         let timing4: [u16; 4] = [12, 12, 12, 12];
         let ld_rr_n16 = Binop(CPU::ld_u16, R8(A), Imm16, 0);
         CPU::init_instr(&mut table, ld_rr_n16, &rr_order, &timing4, 0x01, 0x10, true);
-        println!("ld rr n16 loaded!");
 
         //RELATIVE JUMPS
         let jr_order: [Operand; 5] = [
@@ -188,8 +181,9 @@ impl CPU {
         let pop = Unop(CPU::pop, R8(A), 0);
         let push = Unop(CPU::push, R8(A), 0);
 
-        CPU::init_instr(&mut table, pop, &rr_order, &pop_timing, 0xC1, 0x10, false);
-        CPU::init_instr(&mut table, push, &rr_order, &push_timing, 0xC5, 0x10, false);
+        let pop_order: [Operand; 4] = [R16(BC), R16(DE), R16(HL), R16(AF)];
+        CPU::init_instr(&mut table, pop, &pop_order, &pop_timing, 0xC1, 0x10, false);
+        CPU::init_instr(&mut table, push, &pop_order, &push_timing, 0xC5, 0x10, false);
 
         //ARITHMETIC
         for (i, func) in arith_funcs.iter().enumerate() {
