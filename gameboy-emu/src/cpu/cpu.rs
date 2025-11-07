@@ -13,6 +13,16 @@ use std::fmt;
 
 // ================================== CPU =============================
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+enum Interrupt {
+    VBlank = 0x40,
+    LCDStat = 0x48,
+    Timer = 0x50, // Jumping here without asking, weird
+    Serial = 0x58,
+    Joypad = 0x60,
+}
+
 // Making the opcode decoding a child of CPU!
 pub struct CPU {
     registers: Registers,
@@ -25,6 +35,8 @@ pub struct CPU {
     cb_table: [InstrPointer; 256],
     //for debug purposes
     executing: (u8, InstrPointer),
+    timer_counter: u16, //for TIMA
+    div_counter: u16,
 }
 
 use FlagCondition::*;
@@ -40,7 +52,8 @@ impl CPU {
             self.bus.read(self.registers.pc.wrapping_add(3)),
         ];
 
-        println!("A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
+        println!(
+            "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
             self.registers.a,
             self.registers.f,
             self.registers.b,
@@ -57,14 +70,12 @@ impl CPU {
             pc_mem[3],
         );
     }
-    
-
 
     pub fn new(rom: Vec<u8>) -> Self {
         let bus = Memory::new(rom.clone());
         let (opcode_table, cb_table) = CPU::build_table();
 
-        println!{"{:?}",opcode_table[0x05]};
+        //println! {"{:?}",opcode_table[0xFA]};
 
         //Blarg tests supposes that we start after BIOS exec
         let registers = Registers {
@@ -92,6 +103,8 @@ impl CPU {
             opcode_table,
             cb_table,
             executing,
+            timer_counter: 0,
+            div_counter: 0,
         }
     }
 
@@ -101,9 +114,14 @@ impl CPU {
                 self.halted = false;
             } else {
                 self.clock = self.clock.wrapping_add(4);
-            return;
+                self.tick_timer(4);
+                self.update_ime();
+                return;
+            }
         }
-        }
+
+        self.handle_interrupts();
+        self.update_ime();
 
         CPU::print_state(self);
         let pc = self.registers.get_16register(PC);
@@ -119,38 +137,44 @@ impl CPU {
             self.execute_from_instr(self.opcode_table[opcode as usize], opcode);
         }
         //println!("{:?}", self.registers)
-        self.update_ime();
-    }
+
+        self.handle_interrupts();
+            }
 
     pub fn run(&mut self) {
         loop {
             self.step();
-            // Optional: safety cutoff to prevent infinite loops
+            /* Optional: safety cutoff to prevent infinite loops
             if self.clock > 50_000_000 {
-              println!("❌ Timeout or infinite loop. Test failed or hanging.");
-               break;
-            }
+                println!("❌ Timeout or infinite loop. Test failed or hanging.");
+                break;
+            }*/
         }
     }
 
     fn execute_from_instr(&mut self, instr: InstrPointer, opcode: u8) {
         self.executing = (opcode, instr);
-        //println!("\n0x{:02X} {:<20} === pc: 0x{:04X}", opcode, instr, self.registers.pc);
-        match instr {
-            InstrPointer::Const(func, cycles) => {
+        let cycles = match instr {
+            InstrPointer::Const(func, c) => {
                 func(self);
-                self.clock = self.clock.wrapping_add(cycles as u64);
+                c
             }
-            InstrPointer::Unop(func, op, cycles) => {
+            InstrPointer::Unop(func, op, c) => {
                 func(self, op);
-                self.clock = self.clock.wrapping_add(cycles as u64);
+                c
             }
-            InstrPointer::Binop(func, op1, op2, cycles) => {
+            InstrPointer::Binop(func, op1, op2, c) => {
                 func(self, op1, op2);
-                self.clock = self.clock.wrapping_add(cycles as u64);
+                c
             }
             InstrPointer::None => panic!("Unimplemented opcode"),
-        }
+        };
+
+        // Add cycles to clock
+        self.clock = self.clock.wrapping_add(cycles as u64);
+
+        // Update timer //TODO make all clock additions u8, no need for u16!
+        self.tick_timer(cycles as u8);
     }
 
     fn check_condition(&mut self, op: Operand) -> bool {
@@ -191,6 +215,7 @@ impl CPU {
                 let lsb = self.get_operand_as_u8(Imm8);
                 let msb = self.get_operand_as_u8(Imm8);
                 let address = CPU::fuse_u8(lsb, msb);
+                //println!("{:02X} at {:02X}", self.bus.read(address), address);
                 return self.bus.read(address);
             }
 
@@ -218,34 +243,34 @@ impl CPU {
 
             Address(AddrR16(register)) => {
                 let address = self.registers.get_16register(register);
-                self.bus.write(address, value)
+                self.memwrite(address, value)
             }
             Address(HLInc) => {
                 let address = self.registers.get_16register(HL);
-                self.bus.write(address, value);
+                self.memwrite(address, value);
                 self.registers.set_16register(HL, address.wrapping_add(1));
             }
             Address(HLDec) => {
                 let address = self.registers.get_16register(HL);
-                self.bus.write(address, value);
+                self.memwrite(address, value);
                 self.registers.set_16register(HL, address.wrapping_sub(1));
             }
             Address(ImmAddr16) => {
                 let lsb = self.get_operand_as_u8(Imm8);
                 let msb = self.get_operand_as_u8(Imm8);
                 let address = CPU::fuse_u8(lsb, msb);
-                self.bus.write(address, value);
+                self.memwrite(address, value);
             }
             //For LDH func
             Address(ImmAddr8) => {
                 let offset = self.get_operand_as_u8(Imm8);
                 let address = 0xFF00u16 + offset as u16;
-                self.bus.write(address, value)
+                self.memwrite(address, value)
             }
             Address(AddrR8(register)) => {
                 let offset = self.registers.get_u8register(register);
                 let address = 0xFF00u16 + offset as u16;
-                self.bus.write(address, value)
+                self.memwrite(address, value)
             }
 
             _ => panic!("not a u8 operand for set!"),
@@ -256,14 +281,13 @@ impl CPU {
         match op {
             R16(register) => return self.registers.set_16register(register, value),
             Address(ImmAddr16) => {
-
                 let lsb = self.get_operand_as_u8(Imm8);
                 let msb = self.get_operand_as_u8(Imm8);
 
                 let address = CPU::fuse_u8(lsb, msb);
                 let (vlsb, vmsb) = CPU::split_u16(value);
-                self.bus.write(address, vlsb);
-                self.bus.write(address + 1, vmsb);
+                self.memwrite(address, vlsb);
+                self.memwrite(address + 1, vmsb);
             }
 
             _ => panic!("not a u16 operand for set"),
@@ -299,6 +323,16 @@ impl CPU {
 
     fn fuse_u8(lsb: u8, msb: u8) -> u16 {
         ((msb as u16) << 8) | (lsb as u16)
+    }
+
+    fn memwrite(&mut self, address: u16, value: u8) {
+        if address == 0xFF04 {
+            self.timer_counter = 0; // Reset internal counter
+            self.bus.io[0x04] = 0;
+            return;
+        }
+
+        self.bus.write(address, value);
     }
 
     // ============= Loading =============
@@ -361,9 +395,12 @@ impl CPU {
         let n = self.get_operand_as_u8(op2);
         let carry_in = self.registers.get_flag(CARRY) as u8;
 
-        let result = a.wrapping_sub(n + carry_in);
-        let half_carry = (a & 0xF) < ((n & 0xF) + carry_in);
-        let carry = a < n + carry_in;
+        let n_and_carry = n.wrapping_add(carry_in);
+
+        let result = a.wrapping_sub(n_and_carry);
+
+        let half_carry = (a & 0xF) < ((n & 0xF) + carry_in );
+        let carry = (a as u16) < (n as u16 + carry_in as u16);
 
         self.set_operand_from_u8(op1, result);
         self.update_flags(result == 0, true, half_carry, carry);
@@ -442,12 +479,12 @@ impl CPU {
     // ============= reg16 Arithmetic =============
     pub(crate) fn inc_u16(&mut self, op: Operand) {
         let value = self.get_operand_as_u16(op);
-        self.set_operand_to_u16(op, value + 1);
+        self.set_operand_to_u16(op, value.wrapping_add(1));
     }
 
     pub(crate) fn dec_u16(&mut self, op: Operand) {
         let value = self.get_operand_as_u16(op);
-        self.set_operand_to_u16(op, value - 1);
+        self.set_operand_to_u16(op, value.wrapping_sub(1));
     }
 
     pub(crate) fn add_hl_rr(&mut self, src: Operand) {
@@ -510,16 +547,16 @@ impl CPU {
             let pc = self.registers.get_16register(PC);
             let mut sp = self.registers.get_16register(SP);
 
-            //Address to jump to 
+            //Address to jump to
 
             //storing PC in stack
             let (lsb, msb) = CPU::split_u16(pc);
 
             sp = sp.wrapping_sub(1);
-            self.bus.write(sp, msb); // LSB
+            self.memwrite(sp, msb); // LSB
             sp = sp.wrapping_sub(1);
-            self.bus.write(sp, lsb); // MSB
-            
+            self.memwrite(sp, lsb); // MSB
+
             //updating registers accordingly
             self.registers.set_16register(SP, sp);
             self.registers.set_16register(PC, addr);
@@ -531,18 +568,23 @@ impl CPU {
     }
 
     pub(crate) fn rst(&mut self, address: Operand) {
-        //This func is very similar to call
-        let address_value = self.get_operand_as_u16(address);
+        let addr = self.get_operand_as_u16(address);
         let pc = self.registers.get_16register(PC);
-
         let mut sp = self.registers.get_16register(SP);
-        sp = sp.wrapping_sub(1);
-        self.bus.write(sp, pc as u8); // LSB
-        sp = sp.wrapping_sub(1);
-        self.bus.write(sp, (pc >> 8) as u8); // MSB
-        self.registers.set_16register(SP, sp);
 
-        self.registers.set_16register(PC, address_value as u16);
+        // Push PC to stack in little-endian order: MSB first, then LSB
+        let msb = (pc >> 8) as u8;
+        let lsb = (pc & 0xFF) as u8;
+
+        sp = sp.wrapping_sub(1);
+        self.memwrite(sp, msb);
+        sp = sp.wrapping_sub(1);
+        self.memwrite(sp, lsb);
+
+        self.registers.set_16register(SP, sp);
+        self.registers.set_16register(PC, addr);
+
+        self.clock += 16; // RST always 16 cycles
     }
 
     pub(crate) fn ret(&mut self, condition: Operand) {
@@ -581,9 +623,9 @@ impl CPU {
         let mut sp = self.registers.get_16register(SP);
 
         sp = sp.wrapping_sub(1);
-        self.bus.write(sp, msb);
+        self.memwrite(sp, msb);
         sp = sp.wrapping_sub(1);
-        self.bus.write(sp, lsb);
+        self.memwrite(sp, lsb);
 
         self.registers.set_16register(SP, sp);
     }
@@ -595,7 +637,6 @@ impl CPU {
         sp = sp.wrapping_add(1);
         let msb = self.bus.read(sp);
         sp = sp.wrapping_add(1);
-
 
         let value = CPU::fuse_u8(lsb, msb);
 
@@ -662,31 +703,31 @@ impl CPU {
     }
 
     pub(crate) fn daa(&mut self) {
-    let mut a = self.registers.a;
-    let mut adjust = 0u8;
+        let mut a = self.registers.a;
+        let mut adjust = 0u8;
 
-    if !self.registers.get_flag(SUBSTRACTION) {
-        if self.registers.get_flag(HALFCARRY) || (a & 0x0F) > 9 {
-            adjust |= 0x06;
+        if !self.registers.get_flag(SUBSTRACTION) {
+            if self.registers.get_flag(HALFCARRY) || (a & 0x0F) > 9 {
+                adjust |= 0x06;
+            }
+            if self.registers.get_flag(CARRY) || a > 0x99 {
+                adjust |= 0x60;
+                self.registers.set_flag(CARRY, true);
+            }
+            a = a.wrapping_add(adjust);
+        } else {
+            if self.registers.get_flag(HALFCARRY) {
+                adjust |= 0x06;
+            }
+            if self.registers.get_flag(CARRY) {
+                adjust |= 0x60;
+            }
+            a = a.wrapping_sub(adjust);
         }
-        if self.registers.get_flag(CARRY) || a > 0x99 {
-            adjust |= 0x60;
-            self.registers.set_flag(CARRY, true);
-        }
-        a = a.wrapping_add(adjust);
-    } else {
-        if self.registers.get_flag(HALFCARRY) {
-            adjust |= 0x06;
-        }
-        if self.registers.get_flag(CARRY){
-            adjust |= 0x60;
-        }
-        a = a.wrapping_sub(adjust);
-    }
 
-    self.registers.set_flag(ZERO, a == 0);
-    self.registers.a = a;
-    self.registers.set_flag(HALFCARRY,false);
+        self.registers.set_flag(ZERO, a == 0);
+        self.registers.a = a;
+        self.registers.set_flag(HALFCARRY, false);
     }
 
     pub(crate) fn rlca(&mut self) {
@@ -706,13 +747,13 @@ impl CPU {
         self.clock = self.clock.wrapping_sub(4);
         let keep_carry = self.registers.get_flag(CARRY);
         self.update_flags(false, false, false, keep_carry);
-   }
+    }
     pub(crate) fn rra(&mut self) {
         self.rr(R8(Reg8::A));
         self.clock = self.clock.wrapping_sub(4);
         let keep_carry = self.registers.get_flag(CARRY);
         self.update_flags(false, false, false, keep_carry);
-  }
+    }
 
     pub(crate) fn stop(&mut self, op: Operand) {
         //println!("STOP");
@@ -729,10 +770,99 @@ impl CPU {
     }
 
     fn interrupt_pending(&mut self) -> bool {
-        let ie = self.bus.read(0xFFFF);
-        let iflag = self.bus.read(0xFF0F);
+        let (ie, iflag) = self.get_interrupt_registers();
         (ie & iflag) != 0
     }
+
+    fn get_interrupt_registers(&mut self) -> (u8, u8) {
+        let ie = self.bus.read(0xFFFF);
+        let iflag = self.bus.read(0xFF0F);
+        (ie, iflag)
+    }
+
+    const PRIORITY: [Interrupt; 5] = [
+        Interrupt::VBlank,
+        Interrupt::LCDStat,
+        Interrupt::Timer,
+        Interrupt::Serial,
+        Interrupt::Joypad,
+    ];
+
+    fn handle_interrupts(&mut self) {
+        let (ie, iflag) = self.get_interrupt_registers();
+        let pending = ie & iflag;
+
+        if !self.ime {
+            return;
+        }
+
+        for (idx, interrupt) in CPU::PRIORITY.iter().enumerate() {
+            let mask = 1 << idx;
+            let is_pending = pending & mask != 0;
+            if is_pending {
+                let new_iflag = iflag & !mask;
+                self.memwrite(0xFF0F, new_iflag);
+                self.ime = false;
+                self.ime_pending = false;
+                self.call(Flag(None), Value(*interrupt as u16));
+                break; //<- Only one interrupt per cycle/IME check
+            }
+        }
+    }
+    
+
+    fn tick_div(&mut self, cycles: u8) {
+        self.div_counter = self.div_counter.wrapping_add(cycles as u16);
+        self.memwrite(0xFF04, (self.div_counter >> 8) as u8);
+    }
+
+    fn tick_timer(&mut self, cycles: u8) {
+        // Tick DIV
+        self.tick_div(cycles);
+
+        // Read TAC
+        let tac = self.bus.read(0xFF07);
+        let timer_enabled = tac & 0x04 != 0;
+        let input_clock = tac & 0x03;
+
+        if !timer_enabled {
+            // Timer disabled, nothing to do
+            self.timer_counter = self.timer_counter.wrapping_add(cycles as u16);
+            return;
+        }
+
+        // Map TAC input clock to DIV bit
+        let div_bit = match input_clock {
+            0 => 9,
+            1 => 3,
+            2 => 5,
+            3 => 7,
+            _ => unreachable!(),
+        };
+
+        // Process each cycle individually to catch all rising edges
+        for _ in 0..cycles {
+            let prev_bit = (self.timer_counter >> div_bit) & 1;
+            self.timer_counter = self.timer_counter.wrapping_add(1);
+            let curr_bit = (self.timer_counter >> div_bit) & 1;
+
+            if prev_bit == 0 && curr_bit == 1 {
+                // Rising edge → increment TIMA
+                let tima = self.bus.read(0xFF05);
+                if tima == 0xFF {
+                    // Overflow: reload TMA and request interrupt
+                    let tma = self.bus.read(0xFF06);
+                    self.memwrite(0xFF05, tma);
+
+                    let iflag = self.bus.read(0xFF0F);
+                    self.memwrite(0xFF0F, iflag | 0x04); // Timer interrupt
+                } else {
+                    self.memwrite(0xFF05, tima.wrapping_add(1));
+                }
+            }
+        }
+    }
+
     // ==================== ENDOF NEW AND IMPROVED FUNCS ====================
 
     // $CB Prefixed
@@ -792,11 +922,7 @@ impl CPU {
         let lsb = value & 1;
 
         //not certain about this special case
-        let result = if matches!(op, Address(AddrR16(HL))) {
-            value >> 1
-        } else {
-            value >> 1 | (msb << 7)
-        };
+        let result = value >> 1 | (msb << 7);
 
         self.set_operand_from_u8(op, result);
         self.update_flags(result == 0, false, false, lsb == 1)
@@ -862,7 +988,8 @@ impl fmt::Debug for Registers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "A : 0x{:02X} F : 0x{:08b} \nB : 0x{:02X} C : 0x{:02X} \nD : 0x{:02X} E : 0x{:02X} \nH : 0x{:02X} L : 0x{:02X} \nSP : 0x{:04X} \nPC : 0x{:04X}", self. a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc
+            "A : 0x{:02X} F : 0x{:08b} \nB : 0x{:02X} C : 0x{:02X} \nD : 0x{:02X} E : 0x{:02X} \nH : 0x{:02X} L : 0x{:02X} \nSP : 0x{:04X} \nPC : 0x{:04X}",
+            self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc
         )
     }
 }
@@ -897,7 +1024,7 @@ impl Registers {
 
     fn set_16register(&mut self, register: Reg16, value: u16) {
         fn set_registers(reg1: &mut u8, reg2: &mut u8, value: u16) {
-            let (lsb,msb) = CPU::split_u16(value);
+            let (lsb, msb) = CPU::split_u16(value);
 
             *reg1 = msb;
             *reg2 = lsb;
@@ -1016,33 +1143,30 @@ impl Memory {
         }
     }*/
     fn write(&mut self, address: u16, value: u8) {
-    // Handle serial transfer for Blargg tests
-    
-    /*
-    if address == 0xFF02 && value == 0x81 {
-        // Blargg requested a transfer
-        let c = self.io[0x01] as char; // Read the byte to send
-        print!("{}", c);               // Print immediately
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        self.io[0x02] = 0; // Clear "transfer in progress" flag
-        return;            // Do not write to underlying memory, optional
-    }*/
+        // Handle serial transfer for Blargg tests
+        /*
+        if address == 0xFF02 && value == 0x81 {
+            // Blargg requested a transfer
+            let c = self.io[0x01] as char; // Read the byte to send
+            print!("{}", c);               // Print immediately
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            self.io[0x02] = 0; // Clear "transfer in progress" flag
+            return;            // Do not write to underlying memory, optional
+        }*/
 
-    let (region, address, _, writable) = self.map(address);
+        let (region, address, _, writable) = self.map(address);
 
-    if writable {
-        region[address] = value;
+        if writable {
+            region[address] = value;
+        }
     }
-}
-
 
     fn read(&mut self, address: u16) -> u8 {
         if address == 0xFF44 {
-            return 0x90 //for some gameboy-doctor tests
+            return 0x90; //for some gameboy-doctor tests
         }
         let (region, address, readable, _) = self.map(address);
-        
-        
+
         //println!("R: addr: 0x{:04X}, value: 0x{:02X}", address , region[address]);
         if readable {
             return region[address];
@@ -1073,7 +1197,6 @@ impl Memory {
             0xFF80..=0xFFFE => (&mut self.hram, (address - 0xFF80) as usize, true, true),
 
             0xFFFF => (&mut self.interrupt, 0, true, true),
-
         }
     }
 }

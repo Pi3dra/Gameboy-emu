@@ -183,7 +183,15 @@ impl CPU {
 
         let pop_order: [Operand; 4] = [R16(BC), R16(DE), R16(HL), R16(AF)];
         CPU::init_instr(&mut table, pop, &pop_order, &pop_timing, 0xC1, 0x10, false);
-        CPU::init_instr(&mut table, push, &pop_order, &push_timing, 0xC5, 0x10, false);
+        CPU::init_instr(
+            &mut table,
+            push,
+            &pop_order,
+            &push_timing,
+            0xC5,
+            0x10,
+            false,
+        );
 
         //ARITHMETIC
         for (i, func) in arith_funcs.iter().enumerate() {
@@ -244,7 +252,7 @@ impl CPU {
         //Inconditionals ret, jp, call
         let inconditional = Flag(FlagCondition::None);
         table[0xC9] = Unop(CPU::ret, inconditional, 0);
-        table[0xD8] = Const(CPU::reti, 0);
+        table[0xD9] = Const(CPU::reti, 0);
         table[0xC3] = Binop(CPU::jp, inconditional, Imm16, 0);
         table[0xE9] = Binop(CPU::jp, inconditional, R16(HL), 0);
         table[0xCD] = Binop(CPU::call, inconditional, Imm16, 0);
@@ -252,7 +260,7 @@ impl CPU {
         //Special ones
         table[0xE8] = Const(CPU::add_sp_e8, 16);
         table[0xF8] = Binop(CPU::ld_u16_e8, R16(HL), R16(SP), 12); //ld hl sp+e8
-        table[0xF9] = Binop(CPU::ld_u16, R16(HL), R16(SP), 8); //ld hl sp+e8
+        table[0xF9] = Binop(CPU::ld_u16, R16(SP), R16(HL), 8); //ld hl sp+e8
 
         table[0xF3] = Const(CPU::di, 4);
         table[0xFB] = Const(CPU::ei, 4);
