@@ -7,6 +7,17 @@ const SUBSTRACTION: u8 = 6; //N
 const HALFCARRY: u8 = 5; //H
 const CARRY: u8 = 4; //C
 
+//Some Timer Registers:
+
+const DIV: u16 = 0xFF04;
+const TIMA: u16 = 0xFF05;
+const TMA: u16 = 0xFF06;
+const TAC: u16 = 0xFF07;
+
+//Interrupt registers
+const IF: u16 = 0xFF0F; //Interrupt flag
+const IE: u16 = 0xFFFF; //Interrupt enable
+
 use super::{FlagCondition, MemAdress, Operand, Reg8, Reg16};
 use crate::cpu::opcodes::InstrPointer;
 use std::fmt;
@@ -18,7 +29,7 @@ use std::fmt;
 enum Interrupt {
     VBlank = 0x40,
     LCDStat = 0x48,
-    Timer = 0x50, // Jumping here without asking, weird
+    Timer = 0x50, // Current bug <- Jumping here without asking, weird
     Serial = 0x58,
     Joypad = 0x60,
 }
@@ -35,7 +46,8 @@ pub struct CPU {
     cb_table: [InstrPointer; 256],
     //for debug purposes
     executing: (u8, InstrPointer),
-    timer_counter: u16, //for TIMA
+
+    //Timer
     div_counter: u16,
 }
 
@@ -53,7 +65,7 @@ impl CPU {
         ];
 
         println!(
-            "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
+            "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X} DIV:{:02X} TIMA:{:02X} TMA:{:02X} TAC:{:02X} IE:{:02X} IF:{:02X}",
             self.registers.a,
             self.registers.f,
             self.registers.b,
@@ -68,6 +80,12 @@ impl CPU {
             pc_mem[1],
             pc_mem[2],
             pc_mem[3],
+            self.bus.read(DIV),
+            self.bus.read(TIMA),
+            self.bus.read(TMA),
+            self.bus.read(TAC),
+            self.bus.read(IE),
+            self.bus.read(IF),
         );
     }
 
@@ -103,29 +121,29 @@ impl CPU {
             opcode_table,
             cb_table,
             executing,
-            timer_counter: 0,
             div_counter: 0,
         }
     }
 
     pub fn step(&mut self) {
+        self.update_ime();
         if self.halted {
+            self.clock = self.clock.wrapping_add(4);
+            self.advance_timer(4);
             if self.interrupt_pending() {
                 self.halted = false;
-            } else {
-                self.clock = self.clock.wrapping_add(4);
-                self.tick_timer(4);
-                self.update_ime();
-                return;
+                if self.ime {
+                    self.handle_interrupts();
+                } else {
+                    self.registers.pc = self.registers.pc.wrapping_add(1); // Skip 1st instr after HALT
+                }
             }
+            return;
         }
 
-        self.handle_interrupts();
-        self.update_ime();
+        //CPU::print_state(self);
 
-        CPU::print_state(self);
         let pc = self.registers.get_16register(PC);
-        //println!();
         let opcode = self.bus.read(pc);
 
         if opcode == 0xCB {
@@ -139,7 +157,7 @@ impl CPU {
         //println!("{:?}", self.registers)
 
         self.handle_interrupts();
-            }
+    }
 
     pub fn run(&mut self) {
         loop {
@@ -154,6 +172,7 @@ impl CPU {
 
     fn execute_from_instr(&mut self, instr: InstrPointer, opcode: u8) {
         self.executing = (opcode, instr);
+        let clock1 = self.clock;
         let cycles = match instr {
             InstrPointer::Const(func, c) => {
                 func(self);
@@ -173,8 +192,9 @@ impl CPU {
         // Add cycles to clock
         self.clock = self.clock.wrapping_add(cycles as u64);
 
+        let true_cycles = self.clock - clock1;
         // Update timer //TODO make all clock additions u8, no need for u16!
-        self.tick_timer(cycles as u8);
+        self.advance_timer(true_cycles as u8);
     }
 
     fn check_condition(&mut self, op: Operand) -> bool {
@@ -326,15 +346,14 @@ impl CPU {
     }
 
     fn memwrite(&mut self, address: u16, value: u8) {
-        if address == 0xFF04 {
-            self.timer_counter = 0; // Reset internal counter
-            self.bus.io[0x04] = 0;
+        if address == DIV {
+            self.div_counter = 0;
+            self.bus.write(DIV, 0);
             return;
         }
 
         self.bus.write(address, value);
     }
-
     // ============= Loading =============
 
     //this implements both ldh and ld
@@ -399,7 +418,7 @@ impl CPU {
 
         let result = a.wrapping_sub(n_and_carry);
 
-        let half_carry = (a & 0xF) < ((n & 0xF) + carry_in );
+        let half_carry = (a & 0xF) < ((n & 0xF) + carry_in);
         let carry = (a as u16) < (n as u16 + carry_in as u16);
 
         self.set_operand_from_u8(op1, result);
@@ -756,7 +775,9 @@ impl CPU {
     }
 
     pub(crate) fn stop(&mut self, op: Operand) {
+        self.reset_div();
         //println!("STOP");
+        //TODO: RESET DIV ON STOP
         //panic!("Is STOP really needed?");
         //This has some weird hardware behavior
         //Chek a lot of documentation if implemented in future!
@@ -775,8 +796,8 @@ impl CPU {
     }
 
     fn get_interrupt_registers(&mut self) -> (u8, u8) {
-        let ie = self.bus.read(0xFFFF);
-        let iflag = self.bus.read(0xFF0F);
+        let ie = self.bus.read(IE);
+        let iflag = self.bus.read(IF);
         (ie, iflag)
     }
 
@@ -801,7 +822,7 @@ impl CPU {
             let is_pending = pending & mask != 0;
             if is_pending {
                 let new_iflag = iflag & !mask;
-                self.memwrite(0xFF0F, new_iflag);
+                self.bus.write(IF, new_iflag);
                 self.ime = false;
                 self.ime_pending = false;
                 self.call(Flag(None), Value(*interrupt as u16));
@@ -809,57 +830,65 @@ impl CPU {
             }
         }
     }
-    
 
-    fn tick_div(&mut self, cycles: u8) {
-        self.div_counter = self.div_counter.wrapping_add(cycles as u16);
-        self.memwrite(0xFF04, (self.div_counter >> 8) as u8);
+    //Timer
+    fn reset_div(&mut self) {
+        self.div_counter = 0;
+        self.bus.write(DIV, 0);
     }
 
-    fn tick_timer(&mut self, cycles: u8) {
-        // Tick DIV
-        self.tick_div(cycles);
+    fn tick_div(&mut self) {
+        self.div_counter = self.div_counter.wrapping_add(1);
+        self.bus.write(DIV, self.div_counter as u8);
+    }
 
-        // Read TAC
-        let tac = self.bus.read(0xFF07);
+    fn tac_info(&mut self) -> (bool, u8) {
+        let tac = self.bus.read(TAC);
         let timer_enabled = tac & 0x04 != 0;
-        let input_clock = tac & 0x03;
+        let clock_select = tac & 0x03;
+        let div_bit_to_count: u8 = {
+            match clock_select {
+                0x00 => 7,
+                0x01 => 1,
+                0x10 => 3,
+                0x11 => 5,
+                _ => unreachable!(),
+            }
+        };
+        (timer_enabled, div_bit_to_count)
+    }
+    fn increment_tima(&mut self) {
+        let tima = self.bus.read(TIMA);
+        if tima == 0xFF {
+            let tma = self.bus.read(TMA);
+            self.bus.write(TIMA, tma);
+            let if_reg = self.bus.read(IF) | 0x04;
+            self.bus.write(IF, if_reg);
+        } else {
+            self.bus.write(TIMA, tima.wrapping_add(1));
+        }
+    }
 
-        if !timer_enabled {
-            // Timer disabled, nothing to do
-            self.timer_counter = self.timer_counter.wrapping_add(cycles as u16);
+    fn tick_timer_once(&mut self) {
+        self.tick_div();
+
+        let (enabled, div_bit) = self.tac_info();
+
+        if !enabled {
             return;
         }
 
-        // Map TAC input clock to DIV bit
-        let div_bit = match input_clock {
-            0 => 9,
-            1 => 3,
-            2 => 5,
-            3 => 7,
-            _ => unreachable!(),
-        };
+        let prev = ((self.div_counter.wrapping_sub(1)) >> div_bit) & 1;
+        let curr = (self.div_counter >> div_bit) & 1;
 
-        // Process each cycle individually to catch all rising edges
-        for _ in 0..cycles {
-            let prev_bit = (self.timer_counter >> div_bit) & 1;
-            self.timer_counter = self.timer_counter.wrapping_add(1);
-            let curr_bit = (self.timer_counter >> div_bit) & 1;
+        if prev == 1 && curr == 0 {
+            self.increment_tima();
+        }
+    }
 
-            if prev_bit == 0 && curr_bit == 1 {
-                // Rising edge → increment TIMA
-                let tima = self.bus.read(0xFF05);
-                if tima == 0xFF {
-                    // Overflow: reload TMA and request interrupt
-                    let tma = self.bus.read(0xFF06);
-                    self.memwrite(0xFF05, tma);
-
-                    let iflag = self.bus.read(0xFF0F);
-                    self.memwrite(0xFF0F, iflag | 0x04); // Timer interrupt
-                } else {
-                    self.memwrite(0xFF05, tima.wrapping_add(1));
-                }
-            }
+    fn advance_timer(&mut self, cycles: u8) {
+        for i in 0..cycles {
+            self.tick_timer_once();
         }
     }
 
@@ -1142,17 +1171,19 @@ impl Memory {
             region[address] = value;
         }
     }*/
-    fn write(&mut self, address: u16, value: u8) {
-        // Handle serial transfer for Blargg tests
-        /*
+
+    fn handle_blarg_output(&mut self, address: u16, value: u8) {
         if address == 0xFF02 && value == 0x81 {
-            // Blargg requested a transfer
             let c = self.io[0x01] as char; // Read the byte to send
-            print!("{}", c);               // Print immediately
+            print!("{}", c); // Print immediately
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
             self.io[0x02] = 0; // Clear "transfer in progress" flag
-            return;            // Do not write to underlying memory, optional
-        }*/
+        }
+    }
+
+    fn write(&mut self, address: u16, value: u8) {
+        // Handle serial transfer for Blargg tests
+        self.handle_blarg_output(address, value);
 
         let (region, address, _, writable) = self.map(address);
 

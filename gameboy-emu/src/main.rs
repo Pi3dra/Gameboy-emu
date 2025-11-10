@@ -4,8 +4,8 @@ mod cpu;
 use crate::cpu::CPU;
 
 /*TESTS TO PASS
- 01-special.gb PASSED              
- 02-interrupts.gb PENDING          
+ 01-special.gb PASSED
+ 02-interrupts.gb PENDING
  03-op sp,hl.gb PASSED
  04-op r,imm.gb PASSED
  05-op rp.gb PASSED
@@ -16,7 +16,6 @@ use crate::cpu::CPU;
  10-bit ops.gb FLASHED!
  11-op a,(hl).gb FLASHED!
 * */
-
 
 fn main() {
     let rom: Vec<u8> = std::fs::read("gb-test-roms/cpu_instrs/individual/02-interrupts.gb")
