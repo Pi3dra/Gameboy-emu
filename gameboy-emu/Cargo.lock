@@ -3,10 +3,10 @@
 version = 4
 
 [[package]]
-name = "gameboy-emu"
+name = "RustBoi"
 version = "0.1.0"
 dependencies = [
- "libretro-backend",
+ "libretro-rs",
 ]
 
 [[package]]
@@ -16,20 +16,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
-name = "libretro-backend"
-version = "0.2.1"
+name = "libretro-rs"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "667a71a6fdeec429bd88023eb7cc7b51264881b0cf9835431482a7c2f6e85d6e"
-dependencies = [
- "libc",
- "libretro-sys",
-]
-
-[[package]]
-name = "libretro-sys"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "207b060b02cecbcee6df3d0f5ed38691d5c4df1379dd1acd5c49c9b25d20b439"
+checksum = "8543a86d87661cfe9a9faea8040502ff7e7b82436e5690c6a998f3df9f8f7cb2"
 dependencies = [
  "libc",
 ]

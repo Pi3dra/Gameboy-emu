@@ -1,5 +1,10 @@
 #![allow(dead_code, unused_variables)]
 
+use crate::bus::Bus;
+use crate::bus::BusAccess;
+use std::rc::Rc;
+use std::cell::RefCell;
+
 //Try this: https://robertheaton.com/gameboy-doctor/
 
 const ZERO: u8 = 7; //Z
@@ -36,8 +41,8 @@ enum Interrupt {
 
 // Making the opcode decoding a child of CPU!
 pub struct CPU {
+    bus: Rc<RefCell<Bus>>,
     registers: Registers,
-    bus: Memory,
     clock: u64,
     ime: bool,         // Interrupt Master Enable
     ime_pending: bool, // For delayed EI
@@ -55,13 +60,27 @@ use FlagCondition::*;
 use MemAdress::*;
 use Operand::*;
 use Reg16::*;
+
+
+impl BusAccess for CPU {
+    fn read(&self, addr: u16) -> u8 {
+        self.bus.borrow_mut().read(addr,true)
+    }
+
+    fn write(&mut self, addr: u16, value: u8){
+        self.bus.borrow_mut().write(addr,value,true)
+    }
+}
+
+
 impl CPU {
+
     pub fn print_state(&mut self) {
         let pc_mem = [
-            self.bus.read(self.registers.pc),
-            self.bus.read(self.registers.pc.wrapping_add(1)),
-            self.bus.read(self.registers.pc.wrapping_add(2)),
-            self.bus.read(self.registers.pc.wrapping_add(3)),
+            self.read(self.registers.pc),
+            self.read(self.registers.pc.wrapping_add(1)),
+            self.read(self.registers.pc.wrapping_add(2)),
+            self.read(self.registers.pc.wrapping_add(3)),
         ];
 
         println!(
@@ -80,17 +99,16 @@ impl CPU {
             pc_mem[1],
             pc_mem[2],
             pc_mem[3],
-            self.bus.read(DIV),
-            self.bus.read(TIMA),
-            self.bus.read(TMA),
-            self.bus.read(TAC),
-            self.bus.read(IE),
-            self.bus.read(IF),
+            self.read(DIV),
+            self.read(TIMA),
+            self.read(TMA),
+            self.read(TAC),
+            self.read(IE),
+            self.read(IF),
         );
     }
 
-    pub fn new(rom: Vec<u8>) -> Self {
-        let bus = Memory::new(rom.clone());
+    pub fn new(bus: Rc<RefCell<Bus>>) -> Self {
         let (opcode_table, cb_table) = CPU::build_table();
 
         //println! {"{:?}",opcode_table[0xFA]};
@@ -144,10 +162,10 @@ impl CPU {
         //CPU::print_state(self);
 
         let pc = self.registers.get_16register(PC);
-        let opcode = self.bus.read(pc);
+        let opcode = self.read(pc);
 
         if opcode == 0xCB {
-            let opcode2 = self.bus.read(self.registers.pc.wrapping_add(1));
+            let opcode2 = self.read(self.registers.pc.wrapping_add(1));
             self.registers.pc = pc.wrapping_add(2);
             self.execute_from_instr(self.cb_table[opcode2 as usize], opcode2);
         } else {
@@ -214,41 +232,41 @@ impl CPU {
 
             Address(AddrR16(register)) => {
                 let address = self.registers.get_16register(register);
-                self.bus.read(address)
+                self.read(address)
             }
             Address(HLInc) => {
                 let address = self.registers.get_16register(HL);
                 self.registers.set_16register(HL, address.wrapping_add(1));
-                return self.bus.read(address);
+                return self.read(address);
             }
             Address(HLDec) => {
                 let address = self.registers.get_16register(HL);
                 self.registers.set_16register(HL, address.wrapping_sub(1));
-                return self.bus.read(address);
+                return self.read(address);
             }
             Imm8 => {
                 let address = self.registers.get_16register(PC);
                 self.registers.set_16register(PC, address.wrapping_add(1));
-                return self.bus.read(address);
+                return self.read(address);
             }
             Address(ImmAddr16) => {
                 let lsb = self.get_operand_as_u8(Imm8);
                 let msb = self.get_operand_as_u8(Imm8);
                 let address = CPU::fuse_u8(lsb, msb);
                 //println!("{:02X} at {:02X}", self.bus.read(address), address);
-                return self.bus.read(address);
+                return self.read(address);
             }
 
             //For LDH func
             Address(ImmAddr8) => {
                 let offset = self.get_operand_as_u8(Imm8);
                 let address = CPU::fuse_u8(offset, 0xFF);
-                return self.bus.read(address);
+                return self.read(address);
             }
             Address(AddrR8(register)) => {
                 let offset = self.registers.get_u8register(register);
                 let address = 0xFF00u16 + offset as u16;
-                return self.bus.read(address);
+                return self.read(address);
             }
             Value(n) => n as u8,
 
@@ -348,11 +366,11 @@ impl CPU {
     fn memwrite(&mut self, address: u16, value: u8) {
         if address == DIV {
             self.div_counter = 0;
-            self.bus.write(DIV, 0);
+            self.write(DIV, 0);
             return;
         }
 
-        self.bus.write(address, value);
+        self.write(address, value);
     }
     // ============= Loading =============
 
@@ -610,9 +628,9 @@ impl CPU {
         if self.check_condition(condition) {
             let mut sp = self.registers.get_16register(SP);
             //Not sure of ordering here, is the stack little or big endian?
-            let lsb = self.bus.read(sp);
+            let lsb = self.read(sp);
             sp = sp.wrapping_add(1);
-            let msb = self.bus.read(sp);
+            let msb = self.read(sp);
             sp = sp.wrapping_add(1);
 
             let address = CPU::fuse_u8(lsb, msb);
@@ -652,9 +670,9 @@ impl CPU {
     pub(crate) fn pop(&mut self, op: Operand) {
         let mut sp = self.registers.get_16register(SP);
 
-        let lsb = self.bus.read(sp);
+        let lsb = self.read(sp);
         sp = sp.wrapping_add(1);
-        let msb = self.bus.read(sp);
+        let msb = self.read(sp);
         sp = sp.wrapping_add(1);
 
         let value = CPU::fuse_u8(lsb, msb);
@@ -796,8 +814,8 @@ impl CPU {
     }
 
     fn get_interrupt_registers(&mut self) -> (u8, u8) {
-        let ie = self.bus.read(IE);
-        let iflag = self.bus.read(IF);
+        let ie = self.read(IE);
+        let iflag = self.read(IF);
         (ie, iflag)
     }
 
@@ -822,7 +840,7 @@ impl CPU {
             let is_pending = pending & mask != 0;
             if is_pending {
                 let new_iflag = iflag & !mask;
-                self.bus.write(IF, new_iflag);
+                self.write(IF, new_iflag);
                 self.ime = false;
                 self.ime_pending = false;
                 self.call(Flag(None), Value(*interrupt as u16));
@@ -834,16 +852,16 @@ impl CPU {
     //Timer
     fn reset_div(&mut self) {
         self.div_counter = 0;
-        self.bus.write(DIV, 0);
+        self.write(DIV, 0);
     }
 
     fn tick_div(&mut self) {
         self.div_counter = self.div_counter.wrapping_add(1);
-        self.bus.write(DIV, self.div_counter as u8);
+        self.write(DIV, self.div_counter as u8);
     }
 
     fn tac_info(&mut self) -> (bool, u8) {
-        let tac = self.bus.read(TAC);
+        let tac = self.read(TAC);
         let timer_enabled = tac & 0x04 != 0;
         let clock_select = tac & 0x03;
         let div_bit_to_count: u8 = {
@@ -858,14 +876,14 @@ impl CPU {
         (timer_enabled, div_bit_to_count)
     }
     fn increment_tima(&mut self) {
-        let tima = self.bus.read(TIMA);
+        let tima = self.read(TIMA);
         if tima == 0xFF {
-            let tma = self.bus.read(TMA);
-            self.bus.write(TIMA, tma);
-            let if_reg = self.bus.read(IF) | 0x04;
-            self.bus.write(IF, if_reg);
+            let tma = self.read(TMA);
+            self.write(TIMA, tma);
+            let if_reg = self.read(IF) | 0x04;
+            self.write(IF, if_reg);
         } else {
-            self.bus.write(TIMA, tima.wrapping_add(1));
+            self.write(TIMA, tima.wrapping_add(1));
         }
     }
 
@@ -1102,132 +1120,4 @@ impl Registers {
 
 // ================================== Memory =============================
 
-struct Memory {
-    rom0: [u8; 16_384],
-    romn: [u8; 16_384],
 
-    vram: [u8; 8_192],
-    ram: [u8; 8_192],
-
-    wram1: [u8; 4_096],
-    wram2: [u8; 4_096],
-    hram: [u8; 127],
-
-    oam: [u8; 160],
-
-    io: [u8; 128],
-    interrupt: [u8; 1],
-}
-
-impl Memory {
-    pub fn check_serial(&mut self) -> Option<String> {
-        // Get the serial registers
-        let sb = self.io[0x01]; // 0xFF01: serial data (byte to send)
-        let sc = self.io[0x02]; // 0xFF02: serial control (start transfer if 0x81)
-
-        if sc == 0x81 {
-            // Blargg just requested a serial transfer
-            self.io[0x02] = 0; // emulate completion: clear "transfer in progress"
-            return Some((sb as char).to_string()); // return the output character
-        }
-
-        Option::None // nothing to print this step
-    }
-
-    pub fn new(rom: Vec<u8>) -> Self {
-        // Split ROM into 0x0000–0x3FFF (bank 0) and 0x4000–0x7FFF (bank 1)
-        let mut rom0 = [0u8; 0x4000];
-        let mut romn = [0u8; 0x4000];
-
-        for (i, byte) in rom.iter().enumerate() {
-            if i < 0x4000 {
-                rom0[i] = *byte;
-            } else if i < 0x8000 {
-                romn[i - 0x4000] = *byte;
-            } else {
-                break; // ignore any extra bytes (Game Boy ROM limit per bank)
-            }
-        }
-
-        Self {
-            rom0,
-            romn,
-            vram: [0; 0x2000],
-            ram: [0; 0x2000],
-            wram1: [0; 0x1000],
-            wram2: [0; 0x1000],
-            oam: [0; 0xA0],
-            io: [0; 0x80],
-            hram: [0; 0x7F],
-            interrupt: [0; 1],
-        }
-    }
-
-    /*
-    fn write(&mut self, address: u16, value: u8) {
-        let (region, address, _, writable) = self.map(address);
-
-        if writable {
-            region[address] = value;
-        }
-    }*/
-
-    fn handle_blarg_output(&mut self, address: u16, value: u8) {
-        if address == 0xFF02 && value == 0x81 {
-            let c = self.io[0x01] as char; // Read the byte to send
-            print!("{}", c); // Print immediately
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
-            self.io[0x02] = 0; // Clear "transfer in progress" flag
-        }
-    }
-
-    fn write(&mut self, address: u16, value: u8) {
-        // Handle serial transfer for Blargg tests
-        self.handle_blarg_output(address, value);
-
-        let (region, address, _, writable) = self.map(address);
-
-        if writable {
-            region[address] = value;
-        }
-    }
-
-    fn read(&mut self, address: u16) -> u8 {
-        if address == 0xFF44 {
-            return 0x90; //for some gameboy-doctor tests
-        }
-        let (region, address, readable, _) = self.map(address);
-
-        //println!("R: addr: 0x{:04X}, value: 0x{:02X}", address , region[address]);
-        if readable {
-            return region[address];
-        }
-
-        0xFF
-    }
-
-    fn map(&mut self, address: u16) -> (&mut [u8], usize, bool, bool) {
-        match address {
-            0x0000..=0x3FFF => (&mut self.rom0, address as usize, true, false),
-            0x4000..=0x7FFF => (&mut self.romn, (address - 0x4000) as usize, true, false),
-
-            0x8000..=0x9FFF => (&mut self.vram, (address - 0x8000) as usize, true, true),
-            0xA000..=0xBFFF => (&mut self.ram, (address - 0xA000) as usize, true, true),
-
-            0xC000..=0xCFFF => (&mut self.wram1, (address - 0xC000) as usize, true, true),
-            0xD000..=0xDFFF => (&mut self.wram2, (address - 0xD000) as usize, true, true),
-
-            // Echo RAM mirrors C000–DDFF
-            0xE000..=0xEFFF => (&mut self.wram1, (address - 0xE000) as usize, true, true),
-            0xF000..=0xFDFF => (&mut self.wram2, (address - 0xF000) as usize, true, true),
-
-            0xFE00..=0xFE9F => (&mut self.oam, (address - 0xFE00) as usize, true, true),
-            0xFEA0..=0xFEFF => (&mut self.oam, 0, false, false), // not usable; return dummy
-
-            0xFF00..=0xFF7F => (&mut self.io, (address - 0xFF00) as usize, true, true),
-            0xFF80..=0xFFFE => (&mut self.hram, (address - 0xFF80) as usize, true, true),
-
-            0xFFFF => (&mut self.interrupt, 0, true, true),
-        }
-    }
-}

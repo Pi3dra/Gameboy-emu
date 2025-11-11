@@ -1,11 +1,16 @@
 [package]
-name = "gameboy-emu"
+name = "RustBoi"
 version = "0.1.0"
 edition = "2024"
 
 
 [lib]
+name = "gameboy_emu"
 crate-type = ["cdylib"]
 
+[[bin]]
+name = "gameboy_emu"
+path = "src/main.rs"
+
 [dependencies]
-libretro-backend = "0.2"
+libretro-rs = "0.1"
