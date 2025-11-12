@@ -2,8 +2,8 @@
 
 use crate::bus::Bus;
 use crate::bus::BusAccess;
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 //Try this: https://robertheaton.com/gameboy-doctor/
 
@@ -61,20 +61,17 @@ use MemAdress::*;
 use Operand::*;
 use Reg16::*;
 
-
 impl BusAccess for CPU {
     fn read(&self, addr: u16) -> u8 {
-        self.bus.borrow_mut().read(addr,true)
+        self.bus.borrow_mut().read(addr, true)
     }
 
-    fn write(&mut self, addr: u16, value: u8){
-        self.bus.borrow_mut().write(addr,value,true)
+    fn write(&mut self, addr: u16, value: u8) {
+        self.bus.borrow_mut().write(addr, value, true)
     }
 }
 
-
 impl CPU {
-
     pub fn print_state(&mut self) {
         let pc_mem = [
             self.read(self.registers.pc),
@@ -1119,5 +1116,3 @@ impl Registers {
 }
 
 // ================================== Memory =============================
-
-

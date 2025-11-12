@@ -1,13 +1,13 @@
 #![allow(dead_code)]
+mod bus;
 mod cpu;
 mod ppu;
-mod bus;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::bus::Bus;
 use crate::cpu::CPU;
 use crate::ppu::PPU;
-use crate::bus::Bus;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /*TESTS TO PASS
  01-special.gb PASSED
@@ -24,15 +24,12 @@ use crate::bus::Bus;
 * */
 
 struct GameBoi {
-    cpu : CPU,
-    ppu : Rc<RefCell<PPU>>, 
-    bus : Rc<RefCell<Bus>>,
-
+    cpu: CPU,
+    ppu: Rc<RefCell<PPU>>,
+    bus: Rc<RefCell<Bus>>,
 }
- 
 
 impl GameBoi {
-
     fn new(rom: Vec<u8>) -> Self {
         let bus = Bus::new(rom);
         let ppu = Rc::new(RefCell::new(PPU::new(bus.clone())));
@@ -41,11 +38,10 @@ impl GameBoi {
         Self { cpu, ppu, bus }
     }
 
-    fn run(&mut self){
+    fn run(&mut self) {
         self.cpu.run();
     }
 }
-
 
 fn main() {
     let rom: Vec<u8> = std::fs::read("gb-test-roms/cpu_instrs/individual/07-jr,jp,call,ret,rst.gb")

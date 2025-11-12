@@ -1,7 +1,6 @@
 //LCD control
 const LCDC: u16 = 0xFF40;
-const STAT: u16 = 0xFF41;
-//Scrolling and misc
+const STAT: u16 = 0xFF41; //Scrolling and misc
 const SCY: u16 = 0xFF42;
 const SCX: u16 = 0xFF43;
 const LY: u16 = 0xFF44;
@@ -16,6 +15,7 @@ const WY: u16 = 0xFF4A;
 const WX: u16 = 0xFF4B;
 
 use crate::bus::Bus;
+use crate::bus::BusAccess;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -76,17 +76,68 @@ enum State {
     VBlank,
 }
 
+enum TileIndexing {
+    Unsigned,
+    Signed,
+}
+
+struct LcdcRegister {
+    ppu_enabled: bool,
+    window_tilemap: bool, // 0->0x9800-0x9BFF 1->0x9C00-0x9FFF
+    window_enabled: bool,
+    bg_window_tiles: bool, // 0->0x8800-0x97FF 1->0x8000-0x8FFF
+    bg_tilemap: bool,      // 0->0x9800-0x9BFF 1->0x9C00-0x9FFF
+    obj_size: bool,
+    obj_enable: bool,
+    priority: bool,
+}
+
+impl LcdcRegister {
+    fn new(register: u8) -> Self {
+        Self {
+            ppu_enabled: register & 0x80 != 0,     // Bit 7
+            window_tilemap: register & 0x40 != 0,  // Bit 6
+            window_enabled: register & 0x20 != 0,  // Bit 5
+            bg_window_tiles: register & 0x10 != 0, // Bit 4
+            bg_tilemap: register & 0x08 != 0,      // Bit 3
+            obj_size: register & 0x04 != 0,        // Bit 2
+            obj_enable: register & 0x02 != 0,      // Bit 1
+            priority: register & 0x01 != 0,        // Bit 0
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
 struct Obj {
     x: u8,
     y: u8,
-    tile_number: u8,
+    tile_index: u8,
     priority: u8,
     flipx: bool,
-    fipy: bool,
+    flipy: bool,
     palette: u8,
 }
 
-pub struct PPU{
+impl Obj {
+    fn default() -> Obj {
+        Obj {
+            x: 0,
+            y: 0,
+            tile_index: 0,
+            priority: 0,
+            flipx: false,
+            flipy: false,
+            palette: 0,
+        }
+    }
+}
+
+type TileBytes = [u8; 16];
+type Tile = [[u8; 8]; 8];
+type TileMapIndexed = [[u8; 32]; 32];
+type TileMapTiles = [[Tile; 32]; 32];
+
+pub struct PPU {
     bus: Rc<RefCell<Bus>>,
     background: [u8; 256 * 256],
     viewport: [u8; WIDTH * HEIGHT],
@@ -100,9 +151,37 @@ pub struct PPU{
     line_objs: Vec<u8>,
 }
 
-use State::*;
-impl PPU {
+impl BusAccess for PPU {
+    fn read(&self, addr: u16) -> u8 {
+        self.bus.borrow_mut().read(addr, false)
+    }
 
+    fn write(&mut self, addr: u16, value: u8) {
+        self.bus.borrow_mut().write(addr, value, false);
+    }
+}
+
+use State::*;
+
+const TILE_MAP0_ADDRESS: u16 = 0x9800; // To 0x9BFF
+const TILE_MAP1_ADDRESS: u16 = 0x9C00; // To 0x9BFF
+const TILE_DATA_BASE_UNSIGNED: u16 = 0x8000;
+const TILE_DATA_BASE_SIGNED: u16 = 0x8800;
+const OAM: u16 = 0xFE00; // TO 0xFE9F
+
+/*
+
+Things to do in order
+
+- Fetch and decode OAM
+- Implement DMA
+- Implement FIFO & Fetcher
+
+
+
+*/
+
+impl PPU {
     pub fn new(bus: Rc<RefCell<Bus>>) -> Self {
         let background = [0xFF; 256 * 256];
         let viewport = [0xFF; WIDTH * HEIGHT];
@@ -126,9 +205,161 @@ impl PPU {
         }
     }
 
+    /*
+    Tile info:
+
+    Tile data is stored in VRAM from 0x8000 to 0x97FF -> 384 Tiles
+
+    A tile takes 16 bytes, 8x8 pixels, two bits per pixel = 64*2 = 128 = 16 bytes
+
+    Tiles can be displayed on: Backgrounds, Windows and objects
+
+
+    We have three blocks of 128 tiles each:
+
+    Block 0 -> 0x8000-0x87FF
+    Block 1 -> 0x8800-0x8FFF
+    Block 2 -> 0x9000-0x97FF
+
+
+    Tiles are always indexed using an 8-bit integer, but the addressing method may differ:
+    The “$8000 method” uses $8000 as its base pointer and uses an unsigned addressing, meaning that tiles 0-127 are in block 0, and tiles 128-255 are in block 1.
+
+    The “$8800 method” uses $9000 as its base pointer and uses a signed addressing, meaning that tiles 0-127 are in block 2, and tiles -128 to -1 are in block 1; or, to put it differently, “$8800 addressing” takes tiles 0-127 from block 2 and tiles 128-255 from block 1.
+
+    (You can notice that block 1 is shared by both addressing methods)
+
+    Objects always use “$8000 addressing”, but the BG and Window can use either mode, controlled by LCDC bit 4.
+    * */
+
+    fn fetch_lcdc_register(&self) -> LcdcRegister {
+        LcdcRegister::new(self.read(LCDC))
+    }
+
+    fn fetch_tile_bytes_unsigned(&self, index: u8) -> TileBytes {
+        let mut bytes: [u8; 16] = [0x00; 16];
+        //Starts at Block 0
+        let address: u16 = TILE_DATA_BASE_UNSIGNED + (index as u16 * 16);
+
+        for i in 0..16 {
+            let byte = self.read(address + i);
+            bytes[i as usize] = byte;
+        }
+        bytes
+    }
+
+    fn fetch_tile_bytes_signed(&self, index: i8) -> TileBytes {
+        let mut bytes: [u8; 16] = [0x00; 16];
+        //Starts at Block 1
+        let address: u16 = TILE_DATA_BASE_UNSIGNED + (index as i16 * 16) as u16;
+
+        for i in 0..16 {
+            let byte = self.read(address + i);
+            bytes[i as usize] = byte;
+        }
+        bytes
+    }
+
+    fn build_tile_from_bytes(bytes: [u8; 16]) -> Tile {
+        let mut tile = [[0u8; 8]; 8];
+
+        for row in 0..8 {
+            let high_bits = bytes[row * 2 + 1];
+            let low_bits = bytes[row * 2];
+
+            //This is "zipping" the two bits
+            for column in 0..8 {
+                let mask = 1 << (7 - column);
+                let low = if low_bits & mask != 0 { 1 } else { 0 };
+                let high = if high_bits & mask != 0 { 1 } else { 0 };
+
+                tile[row][column] = (high << 1) | low;
+            }
+        }
+
+        tile
+    }
+
+    //This return a 32x32 grid of tile indexes -> 1024 u8;
+    fn get_tile_map_indexes(&self, address: u16) -> TileMapIndexed {
+        let mut tile_map = [[0u8; 32]; 32];
+
+        for row in 0..32 {
+            for column in 0..32 {
+                let byte_address: u16 = address + (row * 32 + column) as u16;
+                let byte = self.read(byte_address);
+                tile_map[row as usize][column as usize] = byte;
+            }
+        }
+        tile_map
+    }
+
+    fn tile_map_indexes_to_tiles(&self, tilemap: TileMapIndexed, signed: bool) -> TileMapTiles {
+        let mut tilemap_tiles = [[[[0u8; 8]; 8]; 32]; 32];
+
+        for row in 0..32 {
+            for col in 0..32 {
+                let index = tilemap[row][col];
+                let tile_bytes = if signed {
+                    self.fetch_tile_bytes_signed(index as i8)
+                } else {
+                    self.fetch_tile_bytes_unsigned(index)
+                };
+                tilemap_tiles[row][col] = Self::build_tile_from_bytes(tile_bytes);
+            }
+        }
+
+        tilemap_tiles
+    }
+
+    fn get_current_tilemap(&self) -> TileMapTiles {
+        let lcdc = self.fetch_lcdc_register();
+
+        let tilemap_address = if lcdc.bg_tilemap {
+            TILE_MAP1_ADDRESS
+        } else {
+            TILE_MAP0_ADDRESS
+        };
+
+        let signed = !lcdc.bg_window_tiles; // true if using 0x8800 signed addressing
+
+        let indexes = self.get_tile_map_indexes(tilemap_address);
+        self.tile_map_indexes_to_tiles(indexes, signed)
+    }
+
+    //Each object is 4 bytes long
+    fn fetch_object(&self, address: u16) -> Obj {
+        let y = self.read(address) + 16;
+        let x = self.read(address + 1) + 8;
+        let tile_index = self.read(address + 2);
+
+        let flags = self.read(address + 3);
+
+        Obj {
+            x: x,
+            y: y,
+            tile_index: tile_index,
+            priority: flags & 0x80,
+            flipy: flags & 0x40 != 0,
+            flipx: flags & 0x20 != 0,
+            palette: (flags & 0x10) >> 4,
+        }
+    }
+
+    fn fetch_objects_from_oam(&self) -> [Obj; 40] {
+        let mut objects = [Obj::default(); 40];
+
+        for i in 0..40 {
+            objects[i] = self.fetch_object(OAM + (i as u16) * 4);
+        }
+
+        objects
+    }
+
     fn oamsearch() {
         panic!("TODO");
     }
+
     fn pixeltransfer() {
         panic!("TODO");
     }

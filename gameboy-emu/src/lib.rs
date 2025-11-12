@@ -1,6 +1,6 @@
 use libretro_rs::{
-    RetroAudioInfo, RetroCore, RetroEnvironment, RetroGame, RetroLoadGameResult,
-    RetroRuntime, RetroSystemInfo, RetroVideoInfo, libretro_core,
+    RetroAudioInfo, RetroCore, RetroEnvironment, RetroGame, RetroLoadGameResult, RetroRuntime,
+    RetroSystemInfo, RetroVideoInfo, libretro_core,
 };
 
 const WIDTH: usize = 160;

@@ -1,10 +1,9 @@
 use crate::ppu::PPU;
+use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::borrow::BorrowMut;
 
-
-pub struct Bus{
+pub struct Bus {
     memory: Memory,
     ppu: Weak<RefCell<PPU>>,
 }
@@ -28,20 +27,27 @@ pub trait BusAccess {
 /*
 impl BusAccess for PPU{
     fn read(&self, addr: u16) -> u8 {
-        self.bus.read_ppu(addr,false)
+        self.bus.read(addr,false)
     }
+
+    fn write(&mut self, addr: u16, value: u8){
+        self.bus.read(addr,false)
+    }
+
 }
 */
 
+//TODO: Handle blocking ppu side
 impl Bus {
     pub fn new(rom: Vec<u8>) -> Rc<RefCell<Self>> {
-            let memory = Memory::new(rom);
-            Rc::new(RefCell::new(Self {
-                memory,
-                ppu: Weak::new()})) // Initially no PPU
+        let memory = Memory::new(rom);
+        Rc::new(RefCell::new(Self {
+            memory,
+            ppu: Weak::new(),
+        })) // Initially no PPU
     }
 
-    pub fn set_ppu(&mut self, ppu:  Weak<RefCell<PPU>>) {
+    pub fn set_ppu(&mut self, ppu: Weak<RefCell<PPU>>) {
         self.ppu = ppu;
     }
 
