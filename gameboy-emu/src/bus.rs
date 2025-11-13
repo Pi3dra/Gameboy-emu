@@ -3,6 +3,8 @@ use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+const DMA: u16 = 0xFF46;
+
 pub struct Bus {
     memory: Memory,
     ppu: Weak<RefCell<PPU>>,
@@ -37,7 +39,7 @@ impl BusAccess for PPU{
 }
 */
 
-//TODO: Handle blocking ppu side
+//TODO: Handle CPU blocking depending on PPU state
 impl Bus {
     pub fn new(rom: Vec<u8>) -> Rc<RefCell<Self>> {
         let memory = Memory::new(rom);
@@ -53,6 +55,18 @@ impl Bus {
 
     pub fn write(&mut self, address: u16, value: u8, _cpuread: bool) {
         self.memory.write(address, value);
+
+        if address == DMA {
+            let mut new_oam = [0; 160];
+            let base_address = (value as u16) << 8;
+            for i in 0..160 {
+                new_oam[i] = self.memory.read(base_address + i as u16);
+            }
+            self.memory.oam = new_oam;
+            //TODO: Advance cpu clock by 160 M Cycles
+            //Note this is not cycle accurate, normally the dma transfer is done by parts, in which
+            //the cpu can either be executing nops or small procedures in HRAM
+        }
     }
 
     pub fn read(&mut self, address: u16, _cpuread: bool) -> u8 {
