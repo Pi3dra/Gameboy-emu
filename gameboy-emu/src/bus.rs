@@ -1,24 +1,17 @@
-use crate::ppu::PPU;
-use std::borrow::BorrowMut;
+use crate::ppu::StatRegister;
+use crate::ppu::State;
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
-
+use std::rc::Rc;
 const DMA: u16 = 0xFF46;
+const STAT: u16 = 0xFF41;
 
 pub struct Bus {
     memory: Memory,
-    ppu: Weak<RefCell<PPU>>,
 }
 
 /*
-self.bus.read(addr,true)
-
-We can prevent ppu from self blocking itself by forcing the implementation
-to use BusAccess and passing who is requesting the bus.
-
 Currently we only need to separate CPU and PPU acces so a bool is enough,
 but might change to an enum later on?
-
 */
 
 pub trait BusAccess {
@@ -26,36 +19,31 @@ pub trait BusAccess {
     fn write(&mut self, addr: u16, value: u8);
 }
 
-/*
-impl BusAccess for PPU{
-    fn read(&self, addr: u16) -> u8 {
-        self.bus.read(addr,false)
-    }
-
-    fn write(&mut self, addr: u16, value: u8){
-        self.bus.read(addr,false)
-    }
-
-}
-*/
-
 //TODO: Handle CPU blocking depending on PPU state
 impl Bus {
-    pub fn new(rom: Vec<u8>) -> Rc<RefCell<Self>> {
-        let memory = Memory::new(rom);
-        Rc::new(RefCell::new(Self {
-            memory,
-            ppu: Weak::new(),
-        })) // Initially no PPU
+    pub fn empty() -> Rc<RefCell<Self>> {
+        let memory = Memory::new(vec![]);
+        Rc::new(RefCell::new(Self { memory }))
     }
 
-    pub fn set_ppu(&mut self, ppu: Weak<RefCell<PPU>>) {
-        self.ppu = ppu;
+    //This loads from a path
+    pub fn load_rom(&mut self, path: &str) {
+        let rom = std::fs::read(path).expect("Failed to read ROM file");
+        self.memory.load_rom(&rom);
+    }
+
+    //This loads already loaded data
+    pub fn load_rom_data(&mut self, data: &[u8]) {
+        self.memory.load_rom(data);
     }
 
     pub fn write(&mut self, address: u16, value: u8, _cpuread: bool) {
-        self.memory.write(address, value);
+        
+        //if cpuread && self.cpu_can_acces(address){
+            self.memory.write(address, value);
+        //}
 
+        //Handling DMA Transfer
         if address == DMA {
             let mut new_oam = [0; 160];
             let base_address = (value as u16) << 8;
@@ -69,8 +57,28 @@ impl Bus {
         }
     }
 
-    pub fn read(&mut self, address: u16, _cpuread: bool) -> u8 {
-        self.memory.read(address)
+    pub fn read(&mut self, address: u16, cpuread: bool) -> u8 {
+        if cpuread && !self.cpu_can_acces(address){
+            0xFF
+        } else {
+            self.memory.read(address)
+        }
+    }
+
+    fn get_ppu_state(&mut self) -> State {
+        StatRegister::new(self.read(STAT, false)).get_ppu_state()
+    }
+
+    fn cpu_can_acces(&mut self, address: u16) -> bool {
+        match self.get_ppu_state() {
+            State::OAMSearch => !(0xFE00..=0xFE9F).contains(&address),
+
+            State::PixelTransfer => !(0x8000..=0x9FFF).contains(&address),
+
+            State::HBlank | State::VBlank => true,
+
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -92,20 +100,6 @@ struct Memory {
 }
 
 impl Memory {
-    pub fn check_serial(&mut self) -> Option<String> {
-        // Get the serial registers
-        let sb = self.io[0x01]; // 0xFF01: serial data (byte to send)
-        let sc = self.io[0x02]; // 0xFF02: serial control (start transfer if 0x81)
-
-        if sc == 0x81 {
-            // Blargg just requested a serial transfer
-            self.io[0x02] = 0; // emulate completion: clear "transfer in progress"
-            return Some((sb as char).to_string()); // return the output character
-        }
-
-        Option::None // nothing to print this step
-    }
-
     pub fn new(rom: Vec<u8>) -> Self {
         // Split ROM into 0x0000–0x3FFF (bank 0) and 0x4000–0x7FFF (bank 1)
         let mut rom0 = [0u8; 0x4000];
@@ -147,26 +141,31 @@ impl Memory {
     fn write(&mut self, address: u16, value: u8) {
         // Handle serial transfer for Blargg tests
         self.handle_blarg_output(address, value);
-
         let (region, address, _, writable) = self.map(address);
-
         if writable {
             region[address] = value;
         }
     }
 
     fn read(&mut self, address: u16) -> u8 {
-        if address == 0xFF44 {
-            return 0x90; //for some gameboy-doctor tests
-        }
         let (region, address, readable, _) = self.map(address);
-
-        //println!("R: addr: 0x{:04X}, value: 0x{:02X}", address , region[address]);
         if readable {
             return region[address];
         }
 
         0xFF
+    }
+
+    fn load_rom(&mut self, rom: &[u8]) {
+        for (i, byte) in rom.iter().enumerate() {
+            if i < 0x4000 {
+                self.rom0[i] = *byte;
+            } else if i < 0x8000 {
+                self.romn[i - 0x4000] = *byte;
+            } else {
+                break;
+            }
+        }
     }
 
     fn map(&mut self, address: u16) -> (&mut [u8], usize, bool, bool) {

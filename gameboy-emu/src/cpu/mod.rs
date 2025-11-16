@@ -11,6 +11,7 @@ pub(crate) enum Reg16 {
     PC,
 }
 
+#[allow(dead_code)] // F is never constructed but we do use it!
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Reg8 {
     A,
@@ -23,6 +24,7 @@ pub(crate) enum Reg8 {
     L,
 }
 
+#[allow(dead_code)] // for Fixed(u16)
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum MemAdress {
     //memory is u8!

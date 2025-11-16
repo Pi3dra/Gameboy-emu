@@ -1,4 +1,5 @@
 //LCD controlppu
+#![allow(unused_variables, unused, dead_code)]
 const LCDC: u16 = 0xFF40;
 const STAT: u16 = 0xFF41; //Scrolling and misc
 const SCY: u16 = 0xFF42;
@@ -17,56 +18,18 @@ const IF: u16 = 0xFF0F;
 const INT_VBLANK: u8 = 0;
 const INT_STAT: u8 = 1;
 
+//Important Addresses
+const TILE_MAP0_ADDRESS: u16 = 0x9800; // To 0x9BFF
+const TILE_MAP1_ADDRESS: u16 = 0x9C00; // To 0x9BFF
+const TILE_DATA_BASE_UNSIGNED: u16 = 0x8000;
+const TILE_DATA_BASE_SIGNED: u16 = 0x9000;
+const OAM: u16 = 0xFE00; // TO 0xFE9F
+
 use crate::bus::Bus;
 use crate::bus::BusAccess;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
-
-/*
-TECHCNICAL INFO:
-
-Screen
-160x144 Pixels
-4 shades of gray
-8x8 pixel tile-based, 20x18
-
-40 spirites(10 per line)
-
-8KB VRAM
-
-Backgroun Tile Data holds 256 tile-based
-
-The background has 32x32 tiles -> 256, 256 pixels
-
-The viewport is 20 by 18 tiles
-
-OAM Entry
-- Position X
-- Position Y
-- Tile Number
-- Priority
-- Flip X
-- Flip Y
-- Palette (OBP 0 or OBP1)
-
-
-If CPU wants to write to VRAM or OAM, it should pass through the PPU,
-
-If PPU blocks the bus then CPU won't write or will readd FFFF
-
-The idea is to do:
-
-clocks:    20              43             51   <- T Cycles, multiply by 2 for M cycles
-        OAM Search -> Pixel transfer -> H-Blank
-
-During Pixel transfer CPU can't acces VRAM
-
-During OAM Search or Pixel transfer CPU can't acces OAM RAM
-
-Then for pixel transfer there's the whole FIFO pipeline:
-
-Re watch this: https://www.youtube.com/watch?v=HyzD8pNlpwI&t=1734s
-*/
 
 const WIDTH: usize = 160;
 const HEIGHT: usize = 144;
@@ -75,6 +38,27 @@ enum TileIndexing {
     Unsigned,
     Signed,
 }
+
+// ========== Bus acces for both PPU, and PixelFetcher ==========
+
+macro_rules! impl_bus_access {
+    ($t:ty) => {
+        impl BusAccess for $t {
+            fn read(&self, addr: u16) -> u8 {
+                self.bus.borrow_mut().read(addr, false)
+            }
+
+            fn write(&mut self, addr: u16, value: u8) {
+                self.bus.borrow_mut().write(addr, value, false);
+            }
+        }
+    };
+}
+
+impl_bus_access!(PPU);
+impl_bus_access!(PixelFetcher);
+
+// ========== Important registers ==========
 
 struct LcdcRegister {
     ppu_enabled: bool,
@@ -102,7 +86,7 @@ impl LcdcRegister {
     }
 }
 
-struct StatRegister {
+pub struct StatRegister {
     lyc_select: bool,
     mode2: bool,
     mode1: bool,
@@ -112,7 +96,7 @@ struct StatRegister {
 }
 
 impl StatRegister {
-    fn new(register: u8) -> Self {
+    pub fn new(register: u8) -> Self {
         Self {
             //These Bits allows the CPU, to tell the PPU, when to enable a STAT interrupt!
             lyc_select: register & 0x40 != 0,
@@ -122,6 +106,16 @@ impl StatRegister {
             // Other flags
             lyc_compare: register & 0x04 != 0, //  LY==LYC
             ppu_state: register & 0x03,        // 0: HBlank  1:VBlank 2:OAM 3:Drawing
+        }
+    }
+
+    pub fn get_ppu_state(&self) -> State {
+        match self.ppu_state {
+            0 => HBlank,
+            1 => VBlank,
+            2 => OAMSearch,
+            3 => PixelTransfer,
+            _ => unreachable!(),
         }
     }
 }
@@ -158,8 +152,8 @@ type Tile = [[u8; 8]; 8];
 type TileMapIndexed = [[u8; 32]; 32];
 type TileMapTiles = [[Tile; 32]; 32];
 
-#[derive(Clone)]
-enum State {
+#[derive(Clone, Debug)]
+pub enum State {
     Idle = 4,
     OAMSearch = 2,
     PixelTransfer = 3,
@@ -169,129 +163,81 @@ enum State {
 
 pub struct PPU {
     bus: Rc<RefCell<Bus>>,
-    background: [u8; 256 * 256],
+    framebuffer: Option<[u8; WIDTH * HEIGHT]>,
     viewport: [u8; WIDTH * HEIGHT],
 
     state: State,
     fetcher: PixelFetcher,
-    fifo: PixelFIFO,
+    bg_fifo: PixelFIFO,
+    obj_fifo: PixelFIFO,
+
+    fine_scroll_x: u8,
+    popped_pixels: u16,
+    vblank_line_clock: u16,
 
     clock: u16,
-    current_line: u8,
     line_objs: Option<Vec<Obj>>,
 }
 
-impl BusAccess for PPU {
-    fn read(&self, addr: u16) -> u8 {
-        self.bus.borrow_mut().read(addr, false)
-    }
-
-    fn write(&mut self, addr: u16, value: u8) {
-        self.bus.borrow_mut().write(addr, value, false);
-    }
-}
-
 use State::*;
-
-const TILE_MAP0_ADDRESS: u16 = 0x9800; // To 0x9BFF
-const TILE_MAP1_ADDRESS: u16 = 0x9C00; // To 0x9BFF
-const TILE_DATA_BASE_UNSIGNED: u16 = 0x8000;
-const TILE_DATA_BASE_SIGNED: u16 = 0x8800;
-const OAM: u16 = 0xFE00; // TO 0xFE9F
-
-/*
-
-Things to do in order
-
-- Fetch and decode OAM
-- Implement DMA -> Done but cycle inacurate,
-either detect DMA on CPU BusAccess implementation, and augment clock correctly
-or share a shared clock between the ppu, cpu and bus in the gameboy struct, would be nice to have
-a central thing to handle clock timing?
-
-- Implement FIFO & Fetcher
-
-
-
-*/
-
 impl PPU {
     pub fn new(bus: Rc<RefCell<Bus>>) -> Self {
-        let background = [0xFF; 256 * 256];
+        let framebuffer = None;
         let viewport = [0xFF; WIDTH * HEIGHT];
-        let state = Idle;
-        let fetcher = PixelFetcher::new();
-        let fifo = PixelFIFO::new();
+        let state = OAMSearch;
+        let fetcher = PixelFetcher::new(bus.clone());
+        let bg_fifo = PixelFIFO::new();
+        let obj_fifo = PixelFIFO::new();
         let clock = 0;
-        let current_line = 0;
+
+        //This is getting updated nowhere
+        let fine_scroll_x = 0;
+
+        let vblank_line_clock = 0;
+        let popped_pixels = 0;
         let line_objs = None;
 
-        Self {
+        let mut ppu = Self {
             bus,
-            background,
+            framebuffer,
             viewport,
             state,
             fetcher,
-            fifo,
+            bg_fifo,
+            obj_fifo,
+            fine_scroll_x,
+            popped_pixels,
+            vblank_line_clock,
             clock,
-            current_line,
             line_objs,
-        }
+        };
+
+        ppu.write(LCDC, 0x91); // LCDC: enable PPU, etc.
+        ppu.write(STAT, 0x81); // STAT: mode 2 (OAM), interrupts
+        ppu.write(SCY, 0x00); // SCY
+        ppu.write(SCX, 0x00); // SCX
+        ppu.write(LY, 0x00); // LY (overwrites PPU::new)
+        ppu.write(LYC, 0x00); // LYC
+        ppu.write(BGP, 0xFC); // BGP (default palette)
+        ppu.write(OBP0, 0xFF); // OBP0
+        ppu.write(OBP1, 0xFF); // OBP1
+        ppu.write(WX, 0x00);
+        ppu.write(WY, 0x07); // WX (often 7)
+        ppu.write(0xFF0F, 0xE1); // IF (interrupts)
+        ppu.write(0xFFFF, 0x00); // IE (interrupt enable)
+        ppu
     }
 
-    /*
-    Tile info:
-
-    Tile data is stored in VRAM from 0x8000 to 0x97FF -> 384 Tiles
-
-    A tile takes 16 bytes, 8x8 pixels, two bits per pixel = 64*2 = 128 = 16 bytes
-
-    Tiles can be displayed on: Backgrounds, Windows and objects
-
-
-    We have three blocks of 128 tiles each:
-
-    Block 0 -> 0x8000-0x87FF
-    Block 1 -> 0x8800-0x8FFF
-    Block 2 -> 0x9000-0x97FF
-
-
-    Tiles are always indexed using an 8-bit integer, but the addressing method may differ:
-    The “$8000 method” uses $8000 as its base pointer and uses an unsigned addressing, meaning that tiles 0-127 are in block 0, and tiles 128-255 are in block 1.
-
-    The “$8800 method” uses $9000 as its base pointer and uses a signed addressing, meaning that tiles 0-127 are in block 2, and tiles -128 to -1 are in block 1; or, to put it differently, “$8800 addressing” takes tiles 0-127 from block 2 and tiles 128-255 from block 1.
-
-    (You can notice that block 1 is shared by both addressing methods)
-
-    Objects always use “$8000 addressing”, but the BG and Window can use either mode, controlled by LCDC bit 4.
-    * */
-
+    pub fn print_state(&self) {
+        println!(
+            "State {:?} LY {} Clock {}",
+            self.state,
+            self.read(LY),
+            self.clock
+        );
+    }
     fn fetch_lcdc_register(&self) -> LcdcRegister {
         LcdcRegister::new(self.read(LCDC))
-    }
-
-    fn fetch_tile_bytes_unsigned(&self, index: u8) -> TileBytes {
-        let mut bytes: [u8; 16] = [0x00; 16];
-        //Starts at Block 0
-        let address: u16 = TILE_DATA_BASE_UNSIGNED + (index as u16 * 16);
-
-        for i in 0..16 {
-            let byte = self.read(address + i);
-            bytes[i as usize] = byte;
-        }
-        bytes
-    }
-
-    fn fetch_tile_bytes_signed(&self, index: i8) -> TileBytes {
-        let mut bytes: [u8; 16] = [0x00; 16];
-        //Starts at Block 1
-        let address: u16 = TILE_DATA_BASE_UNSIGNED + (index as i16 * 16) as u16;
-
-        for i in 0..16 {
-            let byte = self.read(address + i);
-            bytes[i as usize] = byte;
-        }
-        bytes
     }
 
     fn build_tile_from_bytes(bytes: [u8; 16]) -> Tile {
@@ -314,6 +260,7 @@ impl PPU {
         tile
     }
 
+    /* this seems ot be useless for other than understanding the memory layout and PPU MO
     //This return a 32x32 grid of tile indexes -> 1024 u8;
     fn get_tile_map_indexes(&self, address: u16) -> TileMapIndexed {
         let mut tile_map = [[0u8; 32]; 32];
@@ -361,6 +308,15 @@ impl PPU {
         self.tile_map_indexes_to_tiles(indexes, signed)
     }
 
+    fn get_tilemap(&self, address: u16) -> TileMapTiles {
+        let lcdc = self.fetch_lcdc_register();
+        let signed = !lcdc.bg_window_tiles; // true if using 0x8800 signed addressing
+
+        let indexes = self.get_tile_map_indexes(address);
+        self.tile_map_indexes_to_tiles(indexes, signed)
+    }
+
+    */
     fn fetch_object(&self, address: u16) -> Obj {
         //Each object is 4 bytes long
         let y = self.read(address) + 16;
@@ -414,23 +370,62 @@ impl PPU {
                 break;
             };
         }
+        objects_to_draw.sort_by_key(|obj| obj.x);
         self.line_objs = Some(objects_to_draw);
     }
 
     fn pixeltransfer(&mut self, cycles: u8) {
-        //See: Mode 3 length in
-        todo!();
+        let ly = self.read(LY) as usize;
+
+        for _ in 0..cycles {
+            self.fetcher.step(&mut self.bg_fifo);
+
+            if let Some(px) = self.bg_fifo.pop() {
+                // Discard the first SCX%8 pixels
+                if self.popped_pixels >= self.fine_scroll_x as u16 {
+                    let visible_x = (self.popped_pixels - self.fine_scroll_x as u16) as usize;
+                    if visible_x < WIDTH {
+                        let idx = ly * WIDTH + visible_x;
+                        let bgp = self.read(BGP);
+                        let shade = ((bgp >> (px.color as usize * 2)) & 3) as u8;
+                        println!("popping pixel: {} popped_pixels: {} (fine_x, ly): {},{}" ,shade, self.popped_pixels,self.fine_scroll_x , ly);
+                        self.viewport[idx] = shade;
+                    }
+                }
+                self.popped_pixels += 1;
+            }
+        }
     }
 
-    fn hblank(&mut self, cycles: u8) {
+    fn hblank(&mut self, _cycles: u8) {
         //this does nothing
-        todo!();
     }
 
     fn vblank(&mut self, cycles: u8) {
-        //implement this
-        //Count line
-        todo!();
+        self.vblank_line_clock += cycles as u16;
+        while self.vblank_line_clock >= 456 {
+            self.vblank_line_clock -= 456;
+            let current_ly = self.read(LY);
+            let new_ly = if current_ly >= 153 { 0 } else { current_ly + 1 };
+            self.write(LY, new_ly);
+            // LYC flag/int (same as increment_ly)
+            let lyc = self.read(LYC);
+            let mut stat = self.read(STAT);
+            if new_ly == lyc {
+                stat |= 0x04;
+                if stat & 0x40 != 0 {
+                    self.request_interrupt(INT_STAT);
+                }
+            } else {
+                stat &= !0x04;
+            }
+            self.write(STAT, stat);
+            // Frame ONLY here (153 -> 0)
+            if current_ly == 153 && new_ly == 0 {
+                self.framebuffer = Some(self.viewport.clone());
+                //self.viewport.fill(0);
+            }
+        }
     }
 
     // ============ Changing States ===========
@@ -452,7 +447,6 @@ impl PPU {
 
         match state {
             HBlank => {
-                self.increment_ly();
                 self.hblank(remaining_cycles);
             }
             VBlank => {
@@ -460,6 +454,11 @@ impl PPU {
                 self.vblank(remaining_cycles);
             }
             PixelTransfer => {
+                self.fine_scroll_x = self.read(SCX) % 8;
+                self.popped_pixels = 0;
+                self.bg_fifo.clear();
+                self.fetcher.state = GetTileIndex;
+                self.fetcher.tile_x = 0;
                 self.pixeltransfer(remaining_cycles);
             }
             OAMSearch => {
@@ -492,24 +491,42 @@ impl PPU {
     }
 
     fn increment_ly(&mut self) {
-        let new_ly = self.read(LY) + 1;
+        let current_ly = self.read(LY);
+        let new_ly = if current_ly >= 153 { 0 } else { current_ly + 1 };
+        self.write(LY, new_ly);
 
-        let lyc_eq_ly = self.read(LYC) == new_ly;
+        // LYC == LY compare flag (bit 2 of STAT)
+        let lyc = self.read(LYC);
+        let lyc_eq_ly = lyc == new_ly;
+
+        let mut stat = self.read(STAT);
         if lyc_eq_ly {
-            let old_stat = self.read(STAT);
-            let new_stat = old_stat & !0b100 | (lyc_eq_ly as u8) << 2;
-            self.write(STAT, new_stat);
-        }
-
-        if lyc_eq_ly && (self.read(STAT) & (1 << 6)) != 0 {
-            self.request_interrupt(INT_STAT);
-        }
-
-        if new_ly > 153 {
-            self.write(LY, 0);
+            stat |= 0x04; // Set bit 2
+            // If LYC=LY interrupt is enabled (STAT bit 6), request STAT interrupt
+            if stat & (1 << 6) != 0 {
+                self.request_interrupt(INT_STAT);
+            }
         } else {
-            self.write(LY, new_ly);
+            stat &= !0x04; // Clear bit 2
         }
+        self.write(STAT, stat);
+
+        // Frame ready exactly when LY wraps from 153 → 0
+        if current_ly == 153 && new_ly == 0 {
+            self.framebuffer = Some(self.viewport.clone());
+        }
+    }
+
+    pub fn is_frame_ready(&self) -> bool {
+        matches!(self.framebuffer, Some(_))
+    }
+
+    pub fn clear_buffer(&mut self) {
+        self.framebuffer = None;
+    }
+
+    pub fn yield_frame(&self) -> [u8; 23040] {
+        self.framebuffer.clone().unwrap()
     }
 
     // =========== Running the PPU ==============
@@ -530,7 +547,7 @@ impl PPU {
         }
     }
 
-    fn step(&mut self, cycles: u8) {
+    pub fn step(&mut self, cycles: u8) {
         let mut overflow = None;
 
         // Helper to consume cycles and detect overflow
@@ -545,6 +562,8 @@ impl PPU {
             }
         };
 
+        /*
+        );*/
         let consumed = match self.state {
             OAMSearch => {
                 let remaining = consume(self.state_duration());
@@ -568,11 +587,9 @@ impl PPU {
                 let remaining = consume(self.state_duration());
                 self.hblank(cycles);
                 if remaining > 0 {
-                    let next_state = if self.read(LY) == 143 {
-                        VBlank
-                    } else {
-                        OAMSearch
-                    };
+                    let prev_ly = self.read(LY);
+                    self.increment_ly();
+                    let next_state = if prev_ly == 143 { VBlank } else { OAMSearch };
                     self.change_to_state(next_state, remaining);
                 }
                 cycles - remaining
@@ -582,6 +599,7 @@ impl PPU {
                 let remaining = consume(self.state_duration());
                 self.vblank(cycles.saturating_sub(remaining));
                 if remaining > 0 {
+                    self.framebuffer = Some(self.viewport.clone());
                     self.change_to_state(OAMSearch, remaining);
                 }
                 cycles - remaining
@@ -597,26 +615,249 @@ impl PPU {
     }
 }
 
-struct PixelFIFO {
-    stub: u8,
+// ============= Pixel FIFO ============
+
+#[derive(Copy, Clone)]
+pub struct Pixel {
+    pub color: u8, // 0–3 after palette
+    pub bg_priority: bool,
+    pub sprite_priority: bool,
 }
 
-struct PixelFetcher {
-    start_address: u16,
-    current_address: u16,
+struct PixelFIFO {
+    queue: VecDeque<Pixel>,
 }
 
 impl PixelFIFO {
-    fn new() -> Self {
-        Self { stub: 5 }
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(16),
+        }
+    }
+
+    pub fn push(&mut self, px: Pixel) {
+        if self.queue.len() < 16 {
+            self.queue.push_back(px);
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<Pixel> {
+        self.queue.pop_front()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.queue.len() >= 8
+    }
+
+    pub fn clear(&mut self) {
+        self.queue.clear();
     }
 }
 
+// ============= Pixel Fetcher ============
+#[derive(Copy, Clone, Debug)]
+// The first 4 steps take 2 dots each and the fifth step is attempted every dot until it succeeds
+enum FetcherState {
+    GetTileIndex,
+    GetTileLow,
+    GetTileHigh,
+    Sleep,
+    PushToFifo,
+}
+
+struct PixelFetcher {
+    bus: Rc<RefCell<Bus>>,
+    state: FetcherState,
+    tile_x: u8, // Current horizontal tile index
+    tile_y: u8, // Current vertical tile index (or LY / 8)
+    tile_index: u8,
+    low_byte: u8,
+    high_byte: u8,
+}
+
+use FetcherState::*;
 impl PixelFetcher {
-    fn new() -> Self {
+    fn new(bus: Rc<RefCell<Bus>>) -> Self {
         Self {
-            start_address: 0,
-            current_address: 0,
+            bus: bus,
+            state: FetcherState::GetTileIndex,
+
+            tile_x: 0,
+            tile_y: 0,
+
+            tile_index: 0,
+            low_byte: 0,
+            high_byte: 0,
+        }
+    }
+
+    //TODO! This is lazy
+    fn fetch_lcdc_register(&self) -> LcdcRegister {
+        LcdcRegister::new(self.read(LCDC))
+    }
+
+    fn fetch_tile_bytes_unsigned(&self, index: u8) -> TileBytes {
+        let mut bytes: [u8; 16] = [0x00; 16];
+
+        // Tile address for unsigned mode (0x8000 base)
+        let address: u16 = TILE_DATA_BASE_UNSIGNED
+            .checked_add((index as u16) * 16)
+            .expect("Unsigned tile address overflow");
+
+        for i in 0..16 {
+            bytes[i as usize] = self.read(address + i as u16);
+        }
+
+        bytes
+    }
+
+    fn fetch_tile_bytes_signed(&self, index: i8) -> TileBytes {
+        let mut bytes: [u8; 16] = [0x00; 16];
+
+        // Tile address for signed mode (0x9000 base)
+        // Convert to i32 to safely handle negaive indices
+        let address: u16 = (TILE_DATA_BASE_SIGNED as i32 + (index as i32 * 16)) as u16;
+
+        for i in 0..16 {
+            bytes[i as usize] = self.read(address + i as u16);
+        }
+
+        bytes
+    }
+
+    fn get_tile_idx(&mut self) {
+        let lcdc = self.fetch_lcdc_register();
+        let ly = self.read(LY);
+        let scx = self.read(SCX);
+        let scy = self.read(SCY);
+        let wx = self.read(WX).wrapping_sub(7); // Window X is offset by 7
+        let wy = self.read(WY);
+
+        // Determine if we are fetching window tile
+        let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
+
+        // Tilemap address
+        let tilemap_address = if using_window {
+            if lcdc.window_tilemap {
+                TILE_MAP1_ADDRESS
+            } else {
+                TILE_MAP0_ADDRESS
+            }
+        } else {
+            if lcdc.bg_tilemap {
+                TILE_MAP1_ADDRESS
+            } else {
+                TILE_MAP0_ADDRESS
+            }
+        };
+
+        let tile_x = if using_window {
+            self.tile_x - wx // starts at 0 for first window tile
+        } else {
+            ((scx / 8 + self.tile_x as u8) & 0x1F) as u8
+        };
+
+        let tile_y = if using_window {
+            (ly - wy) / 8
+        } else {
+            (((ly as u16 + scy as u16) / 8) & 0x1F) as u8
+        };
+
+        let byte_address = tilemap_address + (tile_y as u16) * 32 + (tile_x as u16);
+
+        // VRAM access check (mode 3 blocks VRAM) TODO!
+        let tile_index = self.read(byte_address);
+
+        self.tile_index = tile_index;
+        self.state = FetcherState::GetTileLow;
+    }
+
+    //These two are basically rewriting what we did before in the fetch_current_tilemap, and tile
+    //functions, but are actually useful, for other than understanding
+    fn get_tile_low(&mut self) {
+        let lcdc = self.fetch_lcdc_register();
+        let ly = self.read(LY);
+        let scy = self.read(SCY);
+        let wx = self.read(WX).wrapping_sub(7);
+        let wy = self.read(WY);
+
+        // Determine if this tile is part of the window
+        let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
+
+        // Vertical pixel within the tile (0..7)
+        let fine_y = if using_window {
+            ((ly as u16 - wy as u16) % 8) as u8
+        } else {
+            ((ly as u16 + scy as u16) % 8) as u8
+        };
+
+        // Determine addressing mode
+        let signed_addressing = !lcdc.bg_window_tiles; // LCDC.4
+        let tile_bytes = if signed_addressing {
+            self.fetch_tile_bytes_signed(self.tile_index as i8)
+        } else {
+            self.fetch_tile_bytes_unsigned(self.tile_index)
+        };
+
+        self.low_byte = tile_bytes[(fine_y as usize) * 2]; // low byte of row
+        self.state = FetcherState::GetTileHigh;
+    }
+
+    fn get_tile_high(&mut self) {
+        let lcdc = self.fetch_lcdc_register();
+        let ly = self.read(LY);
+        let scy = self.read(SCY);
+        let wx = self.read(WX).wrapping_sub(7);
+        let wy = self.read(WY);
+
+        // Determine if this tile is part of the window
+        let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
+
+        //Is it ok to even use ly, wy, scy, here? 
+        let fine_y = if using_window {
+            ((ly as u16 - wy as u16) % 8) as u8
+        } else {
+            ((ly as u16 + scy as u16) % 8) as u8
+        };
+
+        let signed_addressing = !lcdc.bg_window_tiles;
+
+        let tile_bytes = if signed_addressing {
+            self.fetch_tile_bytes_signed(self.tile_index as i8)
+        } else {
+            self.fetch_tile_bytes_unsigned(self.tile_index)
+        };
+
+        self.high_byte = tile_bytes[(fine_y as usize) * 2 + 1]; // high byte of row
+        self.state = FetcherState::PushToFifo;
+    }
+
+    fn push_to_fifo(&mut self, fifo: &mut PixelFIFO) {
+        // Push 8 pixels from low/high bytes to FIFO
+        for bit in (0..8).rev() {
+            let low_bit = (self.low_byte >> bit) & 1;
+            let high_bit = (self.high_byte >> bit) & 1;
+            let color = (high_bit << 1) | low_bit;
+
+            fifo.push(Pixel {
+                color,
+                bg_priority: false,     // background pixels, no sprite priority
+                sprite_priority: false, // To use later when mixing sprites
+            });
+        }
+
+        // Move to next tile
+        self.tile_x = self.tile_x.wrapping_add(1);
+        self.state = FetcherState::GetTileIndex;
+    }
+
+    fn step(&mut self, fifo: &mut PixelFIFO) {
+        match self.state {
+            GetTileIndex => self.get_tile_idx(),
+            GetTileLow => self.get_tile_low(),
+            GetTileHigh => self.get_tile_high(),
+            PushToFifo => self.push_to_fifo(fifo),
+            Sleep => {}
         }
     }
 }

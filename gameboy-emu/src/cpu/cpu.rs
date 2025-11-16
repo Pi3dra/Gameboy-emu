@@ -140,7 +140,7 @@ impl CPU {
         }
     }
 
-    pub fn step(&mut self) {
+    pub fn step(&mut self) -> u8 {
         self.update_ime();
         if self.halted {
             self.clock = self.clock.wrapping_add(4);
@@ -153,7 +153,7 @@ impl CPU {
                     self.registers.pc = self.registers.pc.wrapping_add(1); // Skip 1st instr after HALT
                 }
             }
-            return;
+            return 4;
         }
 
         //CPU::print_state(self);
@@ -161,17 +161,19 @@ impl CPU {
         let pc = self.registers.get_16register(PC);
         let opcode = self.read(pc);
 
-        if opcode == 0xCB {
-            let opcode2 = self.read(self.registers.pc.wrapping_add(1));
-            self.registers.pc = pc.wrapping_add(2);
-            self.execute_from_instr(self.cb_table[opcode2 as usize], opcode2);
-        } else {
-            self.registers.pc = pc.wrapping_add(1);
-            self.execute_from_instr(self.opcode_table[opcode as usize], opcode);
-        }
-        //println!("{:?}", self.registers)
+        let cycles: u8 = {
+            if opcode == 0xCB {
+                let opcode2 = self.read(self.registers.pc.wrapping_add(1));
+                self.registers.pc = pc.wrapping_add(2);
+                self.execute_from_instr(self.cb_table[opcode2 as usize], opcode2)
+            } else {
+                self.registers.pc = pc.wrapping_add(1);
+                self.execute_from_instr(self.opcode_table[opcode as usize], opcode)
+            }
+        };
 
         self.handle_interrupts();
+        cycles
     }
 
     pub fn run(&mut self) {
@@ -185,7 +187,7 @@ impl CPU {
         }
     }
 
-    fn execute_from_instr(&mut self, instr: InstrPointer, opcode: u8) {
+    fn execute_from_instr(&mut self, instr: InstrPointer, opcode: u8) -> u8 {
         self.executing = (opcode, instr);
         let clock1 = self.clock;
         let cycles = match instr {
@@ -210,6 +212,8 @@ impl CPU {
         let true_cycles = self.clock - clock1;
         // Update timer //TODO make all clock additions u8, no need for u16!
         self.advance_timer(true_cycles as u8);
+
+        true_cycles as u8
     }
 
     fn check_condition(&mut self, op: Operand) -> bool {
