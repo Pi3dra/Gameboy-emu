@@ -30,7 +30,7 @@ impl GameBoi {
         while !self.ppu.is_frame_ready() {
             let cycles = self.cpu.step();
             //self.cpu.print_state();
-            self.ppu.step(cycles * 2);
+            self.ppu.step(cycles / 2);
             //ppu.print_state();
         }
         let frame = self.ppu.yield_frame();

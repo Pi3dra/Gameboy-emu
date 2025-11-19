@@ -37,11 +37,16 @@ impl Bus {
         self.memory.load_rom(data);
     }
 
-    pub fn write(&mut self, address: u16, value: u8, _cpuread: bool) {
-        
-        //if cpuread && self.cpu_can_acces(address){
+    pub fn write(&mut self, address: u16, value: u8, cpuread: bool) {
+        //This breaks loading for some reason
+        /*
+        if cpuread && self.cpu_can_acces(address){
             self.memory.write(address, value);
-        //}
+        } else if !cpuread {
+            self.memory.write(address, value);
+        }*/
+
+        self.memory.write(address, value);
 
         //Handling DMA Transfer
         if address == DMA {
@@ -58,7 +63,7 @@ impl Bus {
     }
 
     pub fn read(&mut self, address: u16, cpuread: bool) -> u8 {
-        if cpuread && !self.cpu_can_acces(address){
+        if cpuread && !self.cpu_can_acces(address) {
             0xFF
         } else {
             self.memory.read(address)

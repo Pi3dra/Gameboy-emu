@@ -388,13 +388,167 @@ impl PPU {
                         let idx = ly * WIDTH + visible_x;
                         let bgp = self.read(BGP);
                         let shade = ((bgp >> (px.color as usize * 2)) & 3) as u8;
-                        println!("popping pixel: {} popped_pixels: {} (fine_x, ly): {},{}" ,shade, self.popped_pixels,self.fine_scroll_x , ly);
+                        println!(
+                            "popping pixel: {} popped_pixels: {} (fine_x, ly): {},{}",
+                            shade, self.popped_pixels, self.fine_scroll_x, ly
+                        );
                         self.viewport[idx] = shade;
                     }
                 }
                 self.popped_pixels += 1;
             }
         }
+    }
+
+    fn render_full_frame(&mut self) {
+        let lcdc = self.fetch_lcdc_register();
+        if !lcdc.ppu_enabled {
+            self.viewport.fill(0); // White screen if disabled
+            return;
+        }
+
+        let bg_map_addr = if lcdc.bg_tilemap {
+            TILE_MAP1_ADDRESS
+        } else {
+            TILE_MAP0_ADDRESS
+        };
+        let win_map_addr = if lcdc.window_tilemap {
+            TILE_MAP1_ADDRESS
+        } else {
+            TILE_MAP0_ADDRESS
+        };
+        let tile_base = if lcdc.bg_window_tiles {
+            TILE_DATA_BASE_UNSIGNED
+        } else {
+            TILE_DATA_BASE_SIGNED
+        };
+        let scy = self.read(SCY);
+        let scx = self.read(SCX);
+        let wy = self.read(WY);
+        let wx = self.read(WX).saturating_sub(7); // Offset by 7
+        let bgp = self.read(BGP);
+        let obp0 = self.read(OBP0);
+        let obp1 = self.read(OBP1);
+
+        // Render BG/Window layer first
+        for ly in 0..HEIGHT {
+            let use_window = lcdc.window_enabled && (ly as u8 >= wy);
+
+            let map_addr = if use_window {
+                win_map_addr
+            } else {
+                bg_map_addr
+            };
+            let map_y = if use_window {
+                (ly as u8 - wy) as u16
+            } else {
+                (ly as u8 + scy) as u16
+            };
+
+            for lx in 0..WIDTH {
+
+                let map_x = if use_window && (lx as u8 >= wx) {
+                    //this wrapping sub makes some weird bugs
+                    ((lx as u8).wrapping_sub(wx)) as u16
+                } else {
+                    ((lx as u8).wrapping_add(scx)) as u16
+                };
+
+                // Get tile index from map
+                let tile_x = (map_x / 8) & 31;
+                let tile_y = (map_y / 8) & 31;
+                let tile_addr = map_addr + tile_y * 32 + tile_x;
+                let tile_idx: i16 = self.read(tile_addr) as i16; // u8 or i8 depending on signed
+
+                // Tile data addr (handle signed/unsigned)
+                let tile_data_addr = if tile_base == TILE_DATA_BASE_SIGNED {
+                    TILE_DATA_BASE_SIGNED.wrapping_add_signed(tile_idx * 16)
+                } else {
+                    tile_base + (tile_idx as u16 * 16)
+                };
+
+                // Pixel within tile
+                let fine_x = (map_x % 8) as u8;
+                let fine_y = (map_y % 8) as u8;
+                let row_addr = tile_data_addr + (fine_y as u16 * 2);
+                let low = self.read(row_addr);
+                let high = self.read(row_addr + 1);
+
+                let bit = 7 - fine_x;
+                let color_id = (((high >> bit) & 1) << 1) | ((low >> bit) & 1);
+                let shade = (bgp >> (color_id * 2)) & 3;
+
+                let idx = ly * WIDTH + lx;
+                self.viewport[idx] = shade;
+            }
+        }
+
+        // Now overlay sprites (like my last suggestion, but full frame)
+        /*
+        if lcdc.obj_enable {
+            let obj_size = if lcdc.obj_size { 16 } else { 8 };
+            let objs = self.fetch_objects_from_oam(); // Or use line_objs if you want per-line
+            for obj in objs.iter() {
+                if obj.x == 0 || obj.y == 0 {
+                    continue;
+                } // Offscreen
+
+                let tile_idx_base = if obj_size == 16 {
+                    obj.tile_index & 0xFE
+                } else {
+                    obj.tile_index
+                };
+
+                for py in 0..obj_size {
+                    let screen_y = (obj.y as i32 - 16 + py as i32) as usize;
+                    if screen_y >= HEIGHT {
+                        continue;
+                    }
+
+                    let tile_idx = if obj_size == 16 && py >= 8 {
+                        tile_idx_base + 1
+                    } else {
+                        tile_idx_base
+                    };
+                    let fine_y = if obj.flipy {
+                        (obj_size - 1 - py) as u8
+                    } else {
+                        py as u8
+                    };
+
+                    let row_addr = 0x8000 + (tile_idx as u16 * 16) + (fine_y as u16 * 2);
+                    let low = self.read(row_addr);
+                    let high = self.read(row_addr + 1);
+
+                    for px in 0..8 {
+                        let screen_x = (obj.x as i32 - 8 + px as i32) as usize;
+                        if screen_x >= WIDTH {
+                            continue;
+                        }
+
+                        let fine_x = if obj.flipx { 7 - px } else { px } as u8;
+                        let bit = 7 - fine_x;
+                        let color_id = (((high >> bit) & 1) << 1) | ((low >> bit) & 1);
+
+                        if color_id == 0 {
+                            continue;
+                        } // Transparent
+
+                        let idx = screen_y * WIDTH + screen_x;
+                        let bg_color = self.viewport[idx];
+
+                        // Priority check
+                        let obj_priority = obj.priority != 0; // Bit7=1 → behind BG colors 1-3
+                        if !obj_priority || bg_color == 0 {
+                            let palette = if obj.palette != 0 { obp1 } else { obp0 };
+                            let shade = (palette >> (color_id * 2)) & 3;
+                            self.viewport[idx] = shade;
+                        }
+                    }
+                }
+            }
+        }
+        */
     }
 
     fn hblank(&mut self, _cycles: u8) {
@@ -454,12 +608,14 @@ impl PPU {
                 self.vblank(remaining_cycles);
             }
             PixelTransfer => {
+                self.fetcher.tile_x = self.read(SCX) / 8;
                 self.fine_scroll_x = self.read(SCX) % 8;
                 self.popped_pixels = 0;
+
                 self.bg_fifo.clear();
                 self.fetcher.state = GetTileIndex;
-                self.fetcher.tile_x = 0;
-                self.pixeltransfer(remaining_cycles);
+                self.render_full_frame(); 
+                //self.pixeltransfer(remaining_cycles);
             }
             OAMSearch => {
                 self.clock = 0;
@@ -802,7 +958,6 @@ impl PixelFetcher {
         self.low_byte = tile_bytes[(fine_y as usize) * 2]; // low byte of row
         self.state = FetcherState::GetTileHigh;
     }
-
     fn get_tile_high(&mut self) {
         let lcdc = self.fetch_lcdc_register();
         let ly = self.read(LY);
@@ -813,7 +968,7 @@ impl PixelFetcher {
         // Determine if this tile is part of the window
         let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
 
-        //Is it ok to even use ly, wy, scy, here? 
+        //Is it ok to even use ly, wy, scy, here?
         let fine_y = if using_window {
             ((ly as u16 - wy as u16) % 8) as u8
         } else {
@@ -830,6 +985,7 @@ impl PixelFetcher {
 
         self.high_byte = tile_bytes[(fine_y as usize) * 2 + 1]; // high byte of row
         self.state = FetcherState::PushToFifo;
+        println!("Got tile (low) {:?}", tile_bytes);
     }
 
     fn push_to_fifo(&mut self, fifo: &mut PixelFIFO) {
