@@ -375,11 +375,20 @@ impl PPU {
     }
 
     fn pixeltransfer(&mut self, cycles: u8) {
+        let lcdc = self.fetch_lcdc_register();
         let ly = self.read(LY) as usize;
-
         for _ in 0..cycles {
-            self.fetcher.step(&mut self.bg_fifo);
+            println!("======================== Fetching =======================");
+            println!("{:?}", self.fetcher);
+            self.fetcher.step(&mut self.bg_fifo, cycles);
+            println!("{:?}", self.bg_fifo);
+            if self.bg_fifo.queue.len() < 8 {
+                return; // do not pop yet
+            }
+            println!("======================== EndOf Fetching =======================\n");
 
+            println!("======================== Popping =======================");
+            println!("{:?}", self.bg_fifo);
             if let Some(px) = self.bg_fifo.pop() {
                 // Discard the first SCX%8 pixels
                 if self.popped_pixels >= self.fine_scroll_x as u16 {
@@ -387,7 +396,13 @@ impl PPU {
                     if visible_x < WIDTH {
                         let idx = ly * WIDTH + visible_x;
                         let bgp = self.read(BGP);
-                        let shade = ((bgp >> (px.color as usize * 2)) & 3) as u8;
+                        let shade = if lcdc.priority { //TODO FIX THIS, WRONG BIT
+                            //the correct line
+                            let bgp = self.read(BGP);
+                            ((bgp >> (px.color as usize * 2)) & 3) as u8
+                        } else {
+                            0 // background disabled
+                        };
                         println!(
                             "popping pixel: {} popped_pixels: {} (fine_x, ly): {},{}",
                             shade, self.popped_pixels, self.fine_scroll_x, ly
@@ -397,158 +412,8 @@ impl PPU {
                 }
                 self.popped_pixels += 1;
             }
+            println!("======================== Endof Popping =======================\n");
         }
-    }
-
-    fn render_full_frame(&mut self) {
-        let lcdc = self.fetch_lcdc_register();
-        if !lcdc.ppu_enabled {
-            self.viewport.fill(0); // White screen if disabled
-            return;
-        }
-
-        let bg_map_addr = if lcdc.bg_tilemap {
-            TILE_MAP1_ADDRESS
-        } else {
-            TILE_MAP0_ADDRESS
-        };
-        let win_map_addr = if lcdc.window_tilemap {
-            TILE_MAP1_ADDRESS
-        } else {
-            TILE_MAP0_ADDRESS
-        };
-        let tile_base = if lcdc.bg_window_tiles {
-            TILE_DATA_BASE_UNSIGNED
-        } else {
-            TILE_DATA_BASE_SIGNED
-        };
-        let scy = self.read(SCY);
-        let scx = self.read(SCX);
-        let wy = self.read(WY);
-        let wx = self.read(WX).saturating_sub(7); // Offset by 7
-        let bgp = self.read(BGP);
-        let obp0 = self.read(OBP0);
-        let obp1 = self.read(OBP1);
-
-        // Render BG/Window layer first
-        for ly in 0..HEIGHT {
-            let use_window = lcdc.window_enabled && (ly as u8 >= wy);
-
-            let map_addr = if use_window {
-                win_map_addr
-            } else {
-                bg_map_addr
-            };
-            let map_y = if use_window {
-                (ly as u8 - wy) as u16
-            } else {
-                (ly as u8 + scy) as u16
-            };
-
-            for lx in 0..WIDTH {
-
-                let map_x = if use_window && (lx as u8 >= wx) {
-                    //this wrapping sub makes some weird bugs
-                    ((lx as u8).wrapping_sub(wx)) as u16
-                } else {
-                    ((lx as u8).wrapping_add(scx)) as u16
-                };
-
-                // Get tile index from map
-                let tile_x = (map_x / 8) & 31;
-                let tile_y = (map_y / 8) & 31;
-                let tile_addr = map_addr + tile_y * 32 + tile_x;
-                let tile_idx: i16 = self.read(tile_addr) as i16; // u8 or i8 depending on signed
-
-                // Tile data addr (handle signed/unsigned)
-                let tile_data_addr = if tile_base == TILE_DATA_BASE_SIGNED {
-                    TILE_DATA_BASE_SIGNED.wrapping_add_signed(tile_idx * 16)
-                } else {
-                    tile_base + (tile_idx as u16 * 16)
-                };
-
-                // Pixel within tile
-                let fine_x = (map_x % 8) as u8;
-                let fine_y = (map_y % 8) as u8;
-                let row_addr = tile_data_addr + (fine_y as u16 * 2);
-                let low = self.read(row_addr);
-                let high = self.read(row_addr + 1);
-
-                let bit = 7 - fine_x;
-                let color_id = (((high >> bit) & 1) << 1) | ((low >> bit) & 1);
-                let shade = (bgp >> (color_id * 2)) & 3;
-
-                let idx = ly * WIDTH + lx;
-                self.viewport[idx] = shade;
-            }
-        }
-
-        // Now overlay sprites (like my last suggestion, but full frame)
-        /*
-        if lcdc.obj_enable {
-            let obj_size = if lcdc.obj_size { 16 } else { 8 };
-            let objs = self.fetch_objects_from_oam(); // Or use line_objs if you want per-line
-            for obj in objs.iter() {
-                if obj.x == 0 || obj.y == 0 {
-                    continue;
-                } // Offscreen
-
-                let tile_idx_base = if obj_size == 16 {
-                    obj.tile_index & 0xFE
-                } else {
-                    obj.tile_index
-                };
-
-                for py in 0..obj_size {
-                    let screen_y = (obj.y as i32 - 16 + py as i32) as usize;
-                    if screen_y >= HEIGHT {
-                        continue;
-                    }
-
-                    let tile_idx = if obj_size == 16 && py >= 8 {
-                        tile_idx_base + 1
-                    } else {
-                        tile_idx_base
-                    };
-                    let fine_y = if obj.flipy {
-                        (obj_size - 1 - py) as u8
-                    } else {
-                        py as u8
-                    };
-
-                    let row_addr = 0x8000 + (tile_idx as u16 * 16) + (fine_y as u16 * 2);
-                    let low = self.read(row_addr);
-                    let high = self.read(row_addr + 1);
-
-                    for px in 0..8 {
-                        let screen_x = (obj.x as i32 - 8 + px as i32) as usize;
-                        if screen_x >= WIDTH {
-                            continue;
-                        }
-
-                        let fine_x = if obj.flipx { 7 - px } else { px } as u8;
-                        let bit = 7 - fine_x;
-                        let color_id = (((high >> bit) & 1) << 1) | ((low >> bit) & 1);
-
-                        if color_id == 0 {
-                            continue;
-                        } // Transparent
-
-                        let idx = screen_y * WIDTH + screen_x;
-                        let bg_color = self.viewport[idx];
-
-                        // Priority check
-                        let obj_priority = obj.priority != 0; // Bit7=1 → behind BG colors 1-3
-                        if !obj_priority || bg_color == 0 {
-                            let palette = if obj.palette != 0 { obp1 } else { obp0 };
-                            let shade = (palette >> (color_id * 2)) & 3;
-                            self.viewport[idx] = shade;
-                        }
-                    }
-                }
-            }
-        }
-        */
     }
 
     fn hblank(&mut self, _cycles: u8) {
@@ -556,29 +421,12 @@ impl PPU {
     }
 
     fn vblank(&mut self, cycles: u8) {
+        self.fetcher.window_line = 0;
         self.vblank_line_clock += cycles as u16;
+
         while self.vblank_line_clock >= 456 {
             self.vblank_line_clock -= 456;
-            let current_ly = self.read(LY);
-            let new_ly = if current_ly >= 153 { 0 } else { current_ly + 1 };
-            self.write(LY, new_ly);
-            // LYC flag/int (same as increment_ly)
-            let lyc = self.read(LYC);
-            let mut stat = self.read(STAT);
-            if new_ly == lyc {
-                stat |= 0x04;
-                if stat & 0x40 != 0 {
-                    self.request_interrupt(INT_STAT);
-                }
-            } else {
-                stat &= !0x04;
-            }
-            self.write(STAT, stat);
-            // Frame ONLY here (153 -> 0)
-            if current_ly == 153 && new_ly == 0 {
-                self.framebuffer = Some(self.viewport.clone());
-                //self.viewport.fill(0);
-            }
+            self.increment_ly();
         }
     }
 
@@ -614,8 +462,7 @@ impl PPU {
 
                 self.bg_fifo.clear();
                 self.fetcher.state = GetTileIndex;
-                self.render_full_frame(); 
-                //self.pixeltransfer(remaining_cycles);
+                self.pixeltransfer(remaining_cycles);
             }
             OAMSearch => {
                 self.clock = 0;
@@ -650,6 +497,25 @@ impl PPU {
         let current_ly = self.read(LY);
         let new_ly = if current_ly >= 153 { 0 } else { current_ly + 1 };
         self.write(LY, new_ly);
+
+        let lcdc = self.fetch_lcdc_register();
+        let wy = self.read(WY);
+
+        if lcdc.window_enabled && current_ly + 1 >= wy {
+            // We are entering or already in window vertically
+            // Increment window_line when LY *increases* into or past WY
+            if current_ly < wy && new_ly >= wy {
+                // First line of window: window_line becomes 0
+                self.fetcher.window_line = 0;
+            //TODO: Make this cleaner
+            } else if new_ly >= wy && self.read(WX) < 167 && self.read(WX) > 6 {
+                // Already in window: increment
+                self.fetcher.window_line += 1;
+            }
+        } else {
+            // Not in window vertically → reset
+            self.fetcher.window_line = 0;
+        }
 
         // LYC == LY compare flag (bit 2 of STAT)
         let lyc = self.read(LYC);
@@ -784,6 +650,23 @@ struct PixelFIFO {
     queue: VecDeque<Pixel>,
 }
 
+use std::fmt;
+
+impl fmt::Debug for PixelFIFO {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PixelFIFO(len={}) [", self.queue.len())?;
+
+        for (i, px) in self.queue.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{}", px.color)?;
+        }
+
+        write!(f, "]")
+    }
+}
+
 impl PixelFIFO {
     pub fn new() -> Self {
         Self {
@@ -801,8 +684,8 @@ impl PixelFIFO {
         self.queue.pop_front()
     }
 
-    pub fn is_full(&self) -> bool {
-        self.queue.len() >= 8
+    pub fn can_push(&self) -> bool {
+        self.queue.len() <= 8
     }
 
     pub fn clear(&mut self) {
@@ -823,12 +706,33 @@ enum FetcherState {
 
 struct PixelFetcher {
     bus: Rc<RefCell<Bus>>,
+    clock: u8,
     state: FetcherState,
+    internal_ly: u8,
     tile_x: u8, // Current horizontal tile index
     tile_y: u8, // Current vertical tile index (or LY / 8)
     tile_index: u8,
     low_byte: u8,
     high_byte: u8,
+
+    window_line: u8, // NEW: track how many lines of the window have been drawn
+    ly_where_window_is_active: u8,
+}
+
+impl fmt::Debug for PixelFetcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "PixelFetcher(state={:?}, tile=({},{}), index={}, low=0x{:02X}, high=0x{:02X}, clock={})",
+            self.state,
+            self.tile_x,
+            self.tile_y,
+            self.tile_index,
+            self.low_byte,
+            self.high_byte,
+            self.clock
+        )
+    }
 }
 
 use FetcherState::*;
@@ -838,12 +742,17 @@ impl PixelFetcher {
             bus: bus,
             state: FetcherState::GetTileIndex,
 
+            internal_ly: 0,
             tile_x: 0,
             tile_y: 0,
 
             tile_index: 0,
             low_byte: 0,
             high_byte: 0,
+            clock: 0,
+
+            window_line: 0,
+            ly_where_window_is_active: 0,
         }
     }
 
@@ -877,20 +786,37 @@ impl PixelFetcher {
         for i in 0..16 {
             bytes[i as usize] = self.read(address + i as u16);
         }
-
         bytes
+    }
+
+    /*
+    fn using_window(&self, lcdc: &LcdcRegister, wx: u8, wy: u8, scx: u8) -> bool {
+        let pixel_x = (self.tile_x as u16) * 8;
+        let visible_x = (pixel_x as i16 - scx as i16).clamp(0, 159) as u8;
+        lcdc.window_enabled && self.internal_ly >= wy && visible_x >= wx
+    }*/
+    fn using_window(&self, lcdc: &LcdcRegister, wx: u8, wy: u8) -> bool {
+        if !lcdc.window_enabled {
+            return false;
+        }
+        if self.internal_ly < wy {
+            return false;
+        }
+        // Current pixel X position on screen (not affected by SCX!)
+        let current_pixel_x = (self.tile_x as u16) * 8; // 0, 8, 16, ...
+
+        current_pixel_x >= wx as u16
     }
 
     fn get_tile_idx(&mut self) {
         let lcdc = self.fetch_lcdc_register();
-        let ly = self.read(LY);
+        self.internal_ly = self.read(LY);
         let scx = self.read(SCX);
         let scy = self.read(SCY);
-        let wx = self.read(WX).wrapping_sub(7); // Window X is offset by 7
+        let wx = self.read(WX).wrapping_sub(7) as u8; // Window X is offset by 7
         let wy = self.read(WY);
 
-        // Determine if we are fetching window tile
-        let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
+        let using_window = self.using_window(&lcdc, wx, wy); //, scx);
 
         // Tilemap address
         let tilemap_address = if using_window {
@@ -908,17 +834,26 @@ impl PixelFetcher {
         };
 
         let tile_x = if using_window {
-            self.tile_x - wx // starts at 0 for first window tile
+            ((self.tile_x * 8).saturating_sub(wx) / 8) as u8
+            //self.tile_x - wx // -> Overflow
         } else {
             ((scx / 8 + self.tile_x as u8) & 0x1F) as u8
         };
 
         let tile_y = if using_window {
-            (ly - wy) / 8
+            println!("window line {}", self.window_line);
+            self.window_line / 8
         } else {
-            (((ly as u16 + scy as u16) / 8) & 0x1F) as u8
+            (((self.internal_ly as u16 + scy as u16) >> 3) & 0xFF) as u8
         };
 
+        /*
+        if using_window && self.internal_ly != self.ly_where_window_is_active {
+            self.window_line += 1;
+            self.ly_where_window_is_active += 1;
+        }*/
+
+        println!("Tile ({},{})", tile_x, tile_y);
         let byte_address = tilemap_address + (tile_y as u16) * 32 + (tile_x as u16);
 
         // VRAM access check (mode 3 blocks VRAM) TODO!
@@ -932,19 +867,18 @@ impl PixelFetcher {
     //functions, but are actually useful, for other than understanding
     fn get_tile_low(&mut self) {
         let lcdc = self.fetch_lcdc_register();
-        let ly = self.read(LY);
         let scy = self.read(SCY);
         let wx = self.read(WX).wrapping_sub(7);
         let wy = self.read(WY);
 
         // Determine if this tile is part of the window
-        let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
+        let using_window = self.using_window(&lcdc, wx, wy); //, 0);
 
-        // Vertical pixel within the tile (0..7)
+        //Vertical pixel within the tile (0..7)
         let fine_y = if using_window {
-            ((ly as u16 - wy as u16) % 8) as u8
+            ((self.window_line) % 8) as u8
         } else {
-            ((ly as u16 + scy as u16) % 8) as u8
+            ((self.internal_ly as u16 + scy as u16) % 8) as u8
         };
 
         // Determine addressing mode
@@ -960,19 +894,18 @@ impl PixelFetcher {
     }
     fn get_tile_high(&mut self) {
         let lcdc = self.fetch_lcdc_register();
-        let ly = self.read(LY);
         let scy = self.read(SCY);
         let wx = self.read(WX).wrapping_sub(7);
         let wy = self.read(WY);
 
         // Determine if this tile is part of the window
-        let using_window = lcdc.window_enabled && ly >= wy && self.tile_x >= wx;
+        let using_window = self.using_window(&lcdc, wx, wy); //, 0);
 
         //Is it ok to even use ly, wy, scy, here?
         let fine_y = if using_window {
-            ((ly as u16 - wy as u16) % 8) as u8
+            ((self.window_line) % 8) as u8
         } else {
-            ((ly as u16 + scy as u16) % 8) as u8
+            ((self.internal_ly as u16 + scy as u16) % 8) as u8
         };
 
         let signed_addressing = !lcdc.bg_window_tiles;
@@ -985,11 +918,15 @@ impl PixelFetcher {
 
         self.high_byte = tile_bytes[(fine_y as usize) * 2 + 1]; // high byte of row
         self.state = FetcherState::PushToFifo;
-        println!("Got tile (low) {:?}", tile_bytes);
     }
 
+    //Q1: How many pixels does this push?
     fn push_to_fifo(&mut self, fifo: &mut PixelFIFO) {
         // Push 8 pixels from low/high bytes to FIFO
+        if !fifo.can_push() {
+            return; //Equivalent to sleeping!
+        }
+
         for bit in (0..8).rev() {
             let low_bit = (self.low_byte >> bit) & 1;
             let high_bit = (self.high_byte >> bit) & 1;
@@ -1002,17 +939,40 @@ impl PixelFetcher {
             });
         }
 
-        // Move to next tile
         self.tile_x = self.tile_x.wrapping_add(1);
         self.state = FetcherState::GetTileIndex;
     }
 
-    fn step(&mut self, fifo: &mut PixelFIFO) {
+    fn step(&mut self, fifo: &mut PixelFIFO, mut cycles: u8) {
         match self.state {
-            GetTileIndex => self.get_tile_idx(),
-            GetTileLow => self.get_tile_low(),
-            GetTileHigh => self.get_tile_high(),
-            PushToFifo => self.push_to_fifo(fifo),
+            GetTileIndex => {
+                self.get_tile_idx();
+                cycles = cycles - 2;
+                if cycles == 0 {
+                    return;
+                }
+            }
+            GetTileLow => {
+                self.get_tile_low();
+                cycles = cycles - 2;
+                if cycles == 0 {
+                    return;
+                }
+            }
+            GetTileHigh => {
+                self.get_tile_high();
+                cycles = cycles - 2;
+                if cycles == 0 {
+                    return;
+                }
+            }
+            PushToFifo => {
+                self.push_to_fifo(fifo);
+                cycles = cycles - 2;
+                if cycles == 0 {
+                    return;
+                }
+            }
             Sleep => {}
         }
     }
