@@ -68,7 +68,7 @@ struct LcdcRegister {
     bg_tilemap: bool,      // 0->0x9800-0x9BFF 1->0x9C00-0x9FFF
     obj_size: bool,
     obj_enable: bool,
-    priority: bool,
+    bg_enable: bool,
 }
 
 impl LcdcRegister {
@@ -81,7 +81,7 @@ impl LcdcRegister {
             bg_tilemap: register & 0x08 != 0,      // Bit 3
             obj_size: register & 0x04 != 0,        // 0 -> 8 , 1 -> 16
             obj_enable: register & 0x02 != 0,      // Bit 1
-            priority: register & 0x01 != 0,        // Bit 0
+            bg_enable: register & 0x01 != 0,       // Bit 0
         }
     }
 }
@@ -120,7 +120,7 @@ impl StatRegister {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Obj {
     x: u8,
     y: u8,
@@ -212,19 +212,6 @@ impl PPU {
             line_objs,
         };
 
-        ppu.write(LCDC, 0x91); // LCDC: enable PPU, etc.
-        ppu.write(STAT, 0x81); // STAT: mode 2 (OAM), interrupts
-        ppu.write(SCY, 0x00); // SCY
-        ppu.write(SCX, 0x00); // SCX
-        ppu.write(LY, 0x00); // LY (overwrites PPU::new)
-        ppu.write(LYC, 0x00); // LYC
-        ppu.write(BGP, 0xFC); // BGP (default palette)
-        ppu.write(OBP0, 0xFF); // OBP0
-        ppu.write(OBP1, 0xFF); // OBP1
-        ppu.write(WX, 0x00);
-        ppu.write(WY, 0x07); // WX (often 7)
-        ppu.write(0xFF0F, 0xE1); // IF (interrupts)
-        ppu.write(0xFFFF, 0x00); // IE (interrupt enable)
         ppu
     }
 
@@ -236,91 +223,17 @@ impl PPU {
             self.clock
         );
     }
+
     fn fetch_lcdc_register(&self) -> LcdcRegister {
         LcdcRegister::new(self.read(LCDC))
     }
 
-    fn build_tile_from_bytes(bytes: [u8; 16]) -> Tile {
-        let mut tile = [[0u8; 8]; 8];
+    // ============ Objects & OAMSearch ============
 
-        for row in 0..8 {
-            let high_bits = bytes[row * 2 + 1];
-            let low_bits = bytes[row * 2];
-
-            //This is "zipping" the two bits
-            for column in 0..8 {
-                let mask = 1 << (7 - column);
-                let low = if low_bits & mask != 0 { 1 } else { 0 };
-                let high = if high_bits & mask != 0 { 1 } else { 0 };
-
-                tile[row][column] = (high << 1) | low;
-            }
-        }
-
-        tile
-    }
-
-    /* this seems ot be useless for other than understanding the memory layout and PPU MO
-    //This return a 32x32 grid of tile indexes -> 1024 u8;
-    fn get_tile_map_indexes(&self, address: u16) -> TileMapIndexed {
-        let mut tile_map = [[0u8; 32]; 32];
-
-        for row in 0..32 {
-            for column in 0..32 {
-                let byte_address: u16 = address + (row * 32 + column) as u16;
-                let byte = self.read(byte_address);
-                tile_map[row as usize][column as usize] = byte;
-            }
-        }
-        tile_map
-    }
-
-    fn tile_map_indexes_to_tiles(&self, tilemap: TileMapIndexed, signed: bool) -> TileMapTiles {
-        let mut tilemap_tiles = [[[[0u8; 8]; 8]; 32]; 32];
-
-        for row in 0..32 {
-            for col in 0..32 {
-                let index = tilemap[row][col];
-                let tile_bytes = if signed {
-                    self.fetch_tile_bytes_signed(index as i8)
-                } else {
-                    self.fetch_tile_bytes_unsigned(index)
-                };
-                tilemap_tiles[row][col] = Self::build_tile_from_bytes(tile_bytes);
-            }
-        }
-
-        tilemap_tiles
-    }
-
-    fn get_current_tilemap(&self) -> TileMapTiles {
-        let lcdc = self.fetch_lcdc_register();
-
-        let tilemap_address = if lcdc.bg_tilemap {
-            TILE_MAP1_ADDRESS
-        } else {
-            TILE_MAP0_ADDRESS
-        };
-
-        let signed = !lcdc.bg_window_tiles; // true if using 0x8800 signed addressing
-
-        let indexes = self.get_tile_map_indexes(tilemap_address);
-        self.tile_map_indexes_to_tiles(indexes, signed)
-    }
-
-    fn get_tilemap(&self, address: u16) -> TileMapTiles {
-        let lcdc = self.fetch_lcdc_register();
-        let signed = !lcdc.bg_window_tiles; // true if using 0x8800 signed addressing
-
-        let indexes = self.get_tile_map_indexes(address);
-        self.tile_map_indexes_to_tiles(indexes, signed)
-    }
-
-    */
     fn fetch_object(&self, address: u16) -> Obj {
         //Each object is 4 bytes long
-        let y = self.read(address) + 16;
-        let x = self.read(address + 1) + 8;
+        let y = self.read(address); // + 16;
+        let x = self.read(address + 1); // + 8;
         let tile_index = self.read(address + 2);
         let flags = self.read(address + 3);
 
@@ -345,7 +258,20 @@ impl PPU {
         objects
     }
 
-    // ============ State Functions ============
+    fn fetch_tile_bytes_unsigned(&self, index: u8) -> TileBytes {
+        let mut bytes: [u8; 16] = [0x00; 16];
+
+        // Tile address for unsigned mode (0x8000 base)
+        let address: u16 = TILE_DATA_BASE_UNSIGNED
+            .checked_add((index as u16) * 16)
+            .expect("Unsigned tile address overflow");
+
+        for i in 0..16 {
+            bytes[i as usize] = self.read(address + i as u16);
+        }
+
+        bytes
+    }
 
     fn oamsearch(&mut self, _cycles: u8) {
         if !matches!(self.line_objs, None) {
@@ -354,65 +280,155 @@ impl PPU {
         }
 
         let lcdc = LcdcRegister::new(self.read(LCDC));
-        let sprite_size = { if lcdc.obj_size { 16 } else { 8 } };
+        let sprite_height = { if lcdc.obj_size { 16 } else { 8 } };
 
         let oam_data = self.fetch_objects_from_oam();
         let ly = self.read(LY);
         let mut objects_to_draw: Vec<Obj> = vec![];
 
         for object_data in oam_data {
-            let should_be_drawn = object_data.y <= ly && object_data.y + sprite_size >= ly;
-            let line_is_full = objects_to_draw.len() < 10;
-            if should_be_drawn && !line_is_full {
-                objects_to_draw.push(object_data);
+            let sprite_top = object_data.y.wrapping_sub(16);
+            let sprite_bottom = sprite_top.wrapping_add(sprite_height);
+
+            if ly >= sprite_top && ly < sprite_bottom {
+                if objects_to_draw.len() < 10 {
+                    objects_to_draw.push(object_data);
+                } else {
+                    break;
+                }
             }
-            if line_is_full {
-                break;
-            };
         }
         objects_to_draw.sort_by_key(|obj| obj.x);
         self.line_objs = Some(objects_to_draw);
     }
 
-    fn pixeltransfer(&mut self, cycles: u8) {
+    // ============ PixelTransfer ============
+
+    fn apply_palette(&self, mut pixel: Pixel) -> Pixel {
+        let palette = match pixel.palette {
+            Option::None => self.read(BGP),
+            Some(0) => self.read(OBP0),
+            Some(1) => self.read(OBP1),
+            _ => unreachable!(),
+        };
+        let shade = ((palette >> (pixel.color * 2)) & 3) as u8;
+        pixel.color = shade;
+        pixel
+    }
+
+    fn objects_at(&mut self, current_x: i32) -> Option<Obj> {
+        let ly = self.read(LY);
+        let mut overlapping_objects: Vec<Obj> = vec![];
+
+        let pixel_on_screen = current_x >= 0 && current_x < WIDTH as i32;
+        if pixel_on_screen {
+            for obj in self.line_objs.as_ref().unwrap() {
+                // check if any sprite starts at this X
+                if (obj.x as i32 - 8) == current_x {
+                    overlapping_objects.push(*obj);
+                }
+            }
+        }
+
+        if overlapping_objects.len() > 1 {
+            //println!("Overlapping! {:?}", overlapping_objects);
+        }
+        //TODO: Handle object priority here
+        if overlapping_objects.is_empty() {
+            None
+        } else {
+            Some(overlapping_objects[0])
+        }
+    }
+
+    fn update_obj_fifo(&mut self, obj: Obj) {
+        let mut sprite = self.fetch_tile_bytes_unsigned(obj.tile_index);
+        let sprite_screen_y = self.read(LY);
+        let fine_y = (sprite_screen_y as u16) % 8;
+
+        let sprite_top_y = obj.y.wrapping_sub(16);
+        let local_y = sprite_screen_y.wrapping_sub(sprite_top_y) as usize;
+
+        if obj.flipy {
+            sprite.reverse();
+        }
+
+        let mut low_byte = sprite[(fine_y as usize) * 2];
+        let mut high_byte = sprite[(fine_y as usize) * 2 + 1];
+
+        if obj.flipx {
+            low_byte = low_byte.reverse_bits();
+            high_byte = high_byte.reverse_bits();
+        };
+
+        self.obj_fifo
+            .push_tile_from_bytes(low_byte, high_byte, Some(obj));
+    }
+
+    fn mix_fifo_pixels(&mut self) -> u8 {
         let lcdc = self.fetch_lcdc_register();
-        let ly = self.read(LY) as usize;
+
+        match (self.bg_fifo.pop(), self.obj_fifo.pop()) {
+            (Some(bg_pixel), Option::None) => {
+                if lcdc.bg_enable {
+                    self.apply_palette(bg_pixel).color
+                } else {
+                    0
+                }
+            }
+            (Some(mut bg_pixel), Some(mut obj_pixel)) => {
+                bg_pixel = self.apply_palette(bg_pixel);
+                obj_pixel = self.apply_palette(obj_pixel);
+
+                if lcdc.obj_enable {
+                    if obj_pixel.color == 0 {
+                        bg_pixel.color
+                    } else {
+                        let bg_is_white = bg_pixel.color == 0;
+                        let sprite_in_front = obj_pixel.sprite_priority;
+                        let use_sprite = bg_is_white || sprite_in_front;
+
+                        if use_sprite {
+                            obj_pixel.color
+                        } else {
+                            bg_pixel.color
+                        }
+                    }
+                } else {
+                    bg_pixel.color
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn pixeltransfer(&mut self, cycles: u8) {
         for _ in 0..cycles {
-            println!("======================== Fetching =======================");
-            println!("{:?}", self.fetcher);
-            self.fetcher.step(&mut self.bg_fifo, cycles);
-            println!("{:?}", self.bg_fifo);
-            if self.bg_fifo.queue.len() < 8 {
+            self.fetcher.step(&mut self.bg_fifo, 2); // This is approximative and wrong (but okysh
+
+            //There should be more than 8 pixels to pop the bg_fifo
+            if self.bg_fifo.queue.len() < 9 {
                 return; // do not pop yet
             }
-            println!("======================== EndOf Fetching =======================\n");
 
-            println!("======================== Popping =======================");
-            println!("{:?}", self.bg_fifo);
-            if let Some(px) = self.bg_fifo.pop() {
-                // Discard the first SCX%8 pixels
-                if self.popped_pixels >= self.fine_scroll_x as u16 {
+            //If there are objects at current coordinates push their pixels into obj_fifo
+            let current_x = self.popped_pixels as i32 - self.fine_scroll_x as i32;
+            if let (Some(obj)) = self.objects_at(current_x) {
+                self.update_obj_fifo(obj);
+            }
+
+            //This both pops and mixes pixels
+            let pixel_to_draw = self.mix_fifo_pixels();
+
+            //We discard useless pixels, so we keep popping
+            if self.popped_pixels >= self.fine_scroll_x as u16 {
                     let visible_x = (self.popped_pixels - self.fine_scroll_x as u16) as usize;
                     if visible_x < WIDTH {
-                        let idx = ly * WIDTH + visible_x;
-                        let bgp = self.read(BGP);
-                        let shade = if lcdc.priority { //TODO FIX THIS, WRONG BIT
-                            //the correct line
-                            let bgp = self.read(BGP);
-                            ((bgp >> (px.color as usize * 2)) & 3) as u8
-                        } else {
-                            0 // background disabled
-                        };
-                        println!(
-                            "popping pixel: {} popped_pixels: {} (fine_x, ly): {},{}",
-                            shade, self.popped_pixels, self.fine_scroll_x, ly
-                        );
-                        self.viewport[idx] = shade;
+                        let idx = self.read(LY) as usize * WIDTH + visible_x;
+                        self.viewport[idx] = pixel_to_draw;
                     }
-                }
-                self.popped_pixels += 1;
             }
-            println!("======================== Endof Popping =======================\n");
+            self.popped_pixels += 1;
         }
     }
 
@@ -599,7 +615,7 @@ impl PPU {
             PixelTransfer => {
                 let remaining = consume(self.state_duration());
                 self.pixeltransfer(cycles.saturating_sub(remaining));
-                if remaining > 0 {
+                if remaining > 0 && self.popped_pixels >= (self.fine_scroll_x as u16 + 160) {
                     self.change_to_state(HBlank, remaining);
                 }
                 cycles - remaining
@@ -644,6 +660,7 @@ pub struct Pixel {
     pub color: u8, // 0–3 after palette
     pub bg_priority: bool,
     pub sprite_priority: bool,
+    pub palette: Option<u8>,
 }
 
 struct PixelFIFO {
@@ -685,11 +702,34 @@ impl PixelFIFO {
     }
 
     pub fn can_push(&self) -> bool {
+        //Seems like making this <= 8 and pop <9 made everything slower?
         self.queue.len() <= 8
     }
 
     pub fn clear(&mut self) {
         self.queue.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.len() == 0
+    }
+
+    pub fn push_tile_from_bytes(&mut self, low: u8, high: u8, obj: Option<Obj>) {
+        let sprite_priority = obj.as_ref().map(|o| o.priority == 0).unwrap_or(false);
+        let palette = obj.as_ref().map(|o| Some(o.palette)).unwrap_or(None);
+
+        for bit in (0..8).rev() {
+            let low_bit = (low >> bit) & 1;
+            let high_bit = (high >> bit) & 1;
+            let color = (high_bit << 1) | low_bit;
+
+            self.push(Pixel {
+                color,
+                bg_priority: false,
+                sprite_priority,
+                palette,
+            });
+        }
     }
 }
 
@@ -717,6 +757,8 @@ struct PixelFetcher {
 
     window_line: u8, // NEW: track how many lines of the window have been drawn
     ly_where_window_is_active: u8,
+
+    discard_pixels: u8,
 }
 
 impl fmt::Debug for PixelFetcher {
@@ -753,6 +795,7 @@ impl PixelFetcher {
 
             window_line: 0,
             ly_where_window_is_active: 0,
+            discard_pixels: 0,
         }
     }
 
@@ -834,26 +877,21 @@ impl PixelFetcher {
         };
 
         let tile_x = if using_window {
-            ((self.tile_x * 8).saturating_sub(wx) / 8) as u8
-            //self.tile_x - wx // -> Overflow
+            let screen_pixel_x = (self.tile_x as u16) * 8;
+            // Safe saturating sub on u16 then /8 back to tile index
+            ((screen_pixel_x.saturating_sub(wx as u16) / 8) & 0x1F) as u8
         } else {
-            ((scx / 8 + self.tile_x as u8) & 0x1F) as u8
+            // For background: fetcher.tile_x already holds SCX/8 at start and increments
+            // every tile pushed. Use it directly (wrap to 0..31).
+            (self.tile_x & 0x1F) as u8
         };
 
         let tile_y = if using_window {
-            println!("window line {}", self.window_line);
             self.window_line / 8
         } else {
             (((self.internal_ly as u16 + scy as u16) >> 3) & 0xFF) as u8
         };
 
-        /*
-        if using_window && self.internal_ly != self.ly_where_window_is_active {
-            self.window_line += 1;
-            self.ly_where_window_is_active += 1;
-        }*/
-
-        println!("Tile ({},{})", tile_x, tile_y);
         let byte_address = tilemap_address + (tile_y as u16) * 32 + (tile_x as u16);
 
         // VRAM access check (mode 3 blocks VRAM) TODO!
@@ -927,17 +965,7 @@ impl PixelFetcher {
             return; //Equivalent to sleeping!
         }
 
-        for bit in (0..8).rev() {
-            let low_bit = (self.low_byte >> bit) & 1;
-            let high_bit = (self.high_byte >> bit) & 1;
-            let color = (high_bit << 1) | low_bit;
-
-            fifo.push(Pixel {
-                color,
-                bg_priority: false,     // background pixels, no sprite priority
-                sprite_priority: false, // To use later when mixing sprites
-            });
-        }
+        fifo.push_tile_from_bytes(self.low_byte, self.high_byte, None);
 
         self.tile_x = self.tile_x.wrapping_add(1);
         self.state = FetcherState::GetTileIndex;

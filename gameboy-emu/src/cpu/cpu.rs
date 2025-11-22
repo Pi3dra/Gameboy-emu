@@ -871,7 +871,7 @@ impl CPU {
                 0x01 => 1,
                 0x10 => 3,
                 0x11 => 5,
-                _ => unreachable!(),
+                _ => 1, //unreachable!(), HOW IS THIS EVEN POSSIBLE?
             }
         };
         (timer_enabled, div_bit_to_count)
