@@ -325,6 +325,7 @@ impl PPU {
             for obj in self.line_objs.as_ref().unwrap() {
                 // check if any sprite starts at this X
                 if (obj.x as i32 - 8) == current_x {
+                    // <- this somewhat controls bad stuff
                     overlapping_objects.push(*obj);
                 }
             }
@@ -342,28 +343,57 @@ impl PPU {
     }
 
     fn update_obj_fifo(&mut self, obj: Obj) {
-        let mut sprite = self.fetch_tile_bytes_unsigned(obj.tile_index);
-        let sprite_screen_y = self.read(LY);
-        let fine_y = (sprite_screen_y as u16) % 8;
-
+        let ly = self.read(LY);
         let sprite_top_y = obj.y.wrapping_sub(16);
-        let local_y = sprite_screen_y.wrapping_sub(sprite_top_y) as usize;
+        let mut local_y = ly.wrapping_sub(sprite_top_y) as usize;
 
-        if obj.flipy {
-            sprite.reverse();
+        let lcdc = self.fetch_lcdc_register();
+        let height = if lcdc.obj_size { 16 } else { 8 };
+
+        // Early out if we're outside the sprite
+        if local_y >= height {
+            return;
         }
 
-        let mut low_byte = sprite[(fine_y as usize) * 2];
-        let mut high_byte = sprite[(fine_y as usize) * 2 + 1];
+        // === Vertical flip ===
+        if obj.flipy {
+            local_y = (height - 1) - local_y;
+        }
 
+        // === Determine which tile and which row inside it ===
+        let tile_index = if height == 16 {
+            // For 8×16: bit 0 of tile index is ignored, we use it to select top/bottom
+            let base = obj.tile_index & 0xFE;
+            if local_y >= 8 { base + 1 } else { base }
+        } else {
+            obj.tile_index
+        };
+
+        let row_in_tile = if height == 16 && local_y >= 8 {
+            local_y - 8
+        } else {
+            local_y
+        };
+
+        // Fetch the correct 16-byte tile
+        let tile_data = self.fetch_tile_bytes_unsigned(tile_index);
+
+        // Get the correct row (0..7)
+        let mut low_byte = tile_data[row_in_tile * 2];
+        let mut high_byte = tile_data[row_in_tile * 2 + 1];
+
+        // Horizontal flip
         if obj.flipx {
             low_byte = low_byte.reverse_bits();
             high_byte = high_byte.reverse_bits();
-        };
+        }
 
+        // Push the 8 pixels
         self.obj_fifo
             .push_tile_from_bytes(low_byte, high_byte, Some(obj));
     }
+
+    
 
     fn mix_fifo_pixels(&mut self) -> u8 {
         let lcdc = self.fetch_lcdc_register();
@@ -412,7 +442,7 @@ impl PPU {
             }
 
             //If there are objects at current coordinates push their pixels into obj_fifo
-            let current_x = self.popped_pixels as i32 - self.fine_scroll_x as i32;
+            let current_x = self.popped_pixels as i32;
             if let (Some(obj)) = self.objects_at(current_x) {
                 self.update_obj_fifo(obj);
             }
@@ -422,11 +452,11 @@ impl PPU {
 
             //We discard useless pixels, so we keep popping
             if self.popped_pixels >= self.fine_scroll_x as u16 {
-                    let visible_x = (self.popped_pixels - self.fine_scroll_x as u16) as usize;
-                    if visible_x < WIDTH {
-                        let idx = self.read(LY) as usize * WIDTH + visible_x;
-                        self.viewport[idx] = pixel_to_draw;
-                    }
+                let visible_x = (self.popped_pixels - self.fine_scroll_x as u16) as usize;
+                if visible_x < WIDTH {
+                    let idx = self.read(LY) as usize * WIDTH + visible_x;
+                    self.viewport[idx] = pixel_to_draw;
+                }
             }
             self.popped_pixels += 1;
         }
@@ -477,6 +507,7 @@ impl PPU {
                 self.popped_pixels = 0;
 
                 self.bg_fifo.clear();
+                self.obj_fifo.clear();
                 self.fetcher.state = GetTileIndex;
                 self.pixeltransfer(remaining_cycles);
             }

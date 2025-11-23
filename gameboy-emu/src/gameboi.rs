@@ -10,6 +10,7 @@ pub struct GameBoi {
     bus: Rc<RefCell<Bus>>,
 }
 
+
 impl GameBoi {
     pub fn new() -> Self {
         let bus = Bus::empty();
