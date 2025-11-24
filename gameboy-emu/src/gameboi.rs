@@ -3,6 +3,7 @@ use crate::cpu::CPU;
 use crate::ppu::PPU;
 use std::cell::RefCell;
 use std::rc::Rc;
+const IF : u16 = 0xFF0F;
 
 pub struct GameBoi {
     cpu: CPU,
@@ -27,6 +28,14 @@ impl GameBoi {
         self.bus.borrow_mut().load_rom_data(rom_data);
     }
 
+    pub fn receive_input(&mut self, input_value: u8){
+        let mut bus = self.bus.borrow_mut();
+        bus.write(0xFF00, input_value,false); 
+        let if_reg = bus.read(IF, false);
+        bus.write(IF, if_reg | 0x10,false);
+    }
+
+
     pub fn step(&mut self) -> [u8; 23040] {
         while !self.ppu.is_frame_ready() {
             let cycles = self.cpu.step();
@@ -35,7 +44,6 @@ impl GameBoi {
             //ppu.print_state();
         }
         let frame = self.ppu.yield_frame();
-        println!("YIELDED FRAME");
         self.ppu.clear_buffer();
         frame
     }

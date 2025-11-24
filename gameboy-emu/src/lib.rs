@@ -1,6 +1,6 @@
 use libretro_rs::{
     RetroAudioInfo, RetroCore, RetroEnvironment, RetroGame, RetroLoadGameResult, RetroRuntime,
-    RetroSystemInfo, RetroVideoInfo, libretro_core,
+    RetroSystemInfo, RetroVideoInfo, RetroJoypadButton,libretro_core,
 };
 
 mod bus;
@@ -41,6 +41,7 @@ struct RustBoiCore {
     gameboi: GameBoi,
 }
 
+use RetroJoypadButton::*;
 impl RetroCore for RustBoiCore {
     fn init(_env: &RetroEnvironment) -> Self {
         let mut core = Self {
@@ -95,6 +96,24 @@ impl RetroCore for RustBoiCore {
                 self.framebuffer.len() * std::mem::size_of::<u16>(),
             )
         };
+
+
+        let mut joypad_input = 0xCF;
+        if runtime.is_joypad_button_pressed(0,A){joypad_input &= !0x01;}
+        if runtime.is_joypad_button_pressed(0,B){joypad_input &= !0x02;}
+        if runtime.is_joypad_button_pressed(0,Select){joypad_input &= !0x04;}
+        if runtime.is_joypad_button_pressed(0,Start){joypad_input &= !0x08;}
+
+        if runtime.is_joypad_button_pressed(0,Up){joypad_input &= !0x01;}
+        if runtime.is_joypad_button_pressed(0,Down){joypad_input &= !0x02;}
+        if runtime.is_joypad_button_pressed(0,Left){joypad_input &= !0x04;}
+        if runtime.is_joypad_button_pressed(0,Right){joypad_input &= !0x08;}
+
+        if joypad_input != 0xCF{
+            println!("INPUT {}", joypad_input);
+        }
+        self.gameboi.receive_input(joypad_input);
+
 
         // Now upload as raw bytes with correct pitch
         runtime.upload_video_frame(bytes, WIDTH as u32, HEIGHT as u32, WIDTH * 2);

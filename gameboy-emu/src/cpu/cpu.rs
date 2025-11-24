@@ -837,9 +837,14 @@ impl CPU {
         }
 
         for (idx, interrupt) in CPU::PRIORITY.iter().enumerate() {
-            let mask = 1 << idx;
+                        let mask = 1 << idx;
             let is_pending = pending & mask != 0;
             if is_pending {
+                if matches!(interrupt, Interrupt::Joypad){
+                println!("Servicing Joypad");
+            }
+
+
                 let new_iflag = iflag & !mask;
                 self.write(IF, new_iflag);
                 self.ime = false;
