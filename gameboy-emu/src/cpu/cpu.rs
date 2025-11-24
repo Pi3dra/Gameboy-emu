@@ -30,7 +30,7 @@ use std::fmt;
 // ================================== CPU =============================
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Interrupt {
     VBlank = 0x40,
     LCDStat = 0x48,
@@ -142,22 +142,27 @@ impl CPU {
 
     pub fn step(&mut self) -> u8 {
         self.update_ime();
+
+        if self.ime && self.interrupt_pending() {
+            self.handle_interrupts();
+            // After servicing interrupt, we still consume the cycles of a normal instruction fetch
+            // (but we don't execute anything else this cycle)
+            self.clock += 4;
+            self.advance_timer(4);
+            return 4;
+        }
         if self.halted {
-            self.clock = self.clock.wrapping_add(4);
+            self.clock += 4;
             self.advance_timer(4);
             if self.interrupt_pending() {
                 self.halted = false;
-                if self.ime {
-                    self.handle_interrupts();
-                } else {
-                    self.registers.pc = self.registers.pc.wrapping_add(1); // Skip 1st instr after HALT
-                }
+                // When exiting HALT due to interrupt + IME=1, no extra PC skip
             }
             return 4;
         }
-
         //CPU::print_state(self);
 
+        //self.handle_interrupts();
         let pc = self.registers.get_16register(PC);
         let opcode = self.read(pc);
 
@@ -172,7 +177,6 @@ impl CPU {
             }
         };
 
-        self.handle_interrupts();
         cycles
     }
 
@@ -828,6 +832,14 @@ impl CPU {
         Interrupt::Joypad,
     ];
 
+    const INTERRUPT_MASKS: [u8; 5] = [
+        1 << 0, // VBlank
+        1 << 1, // LCD STAT
+        1 << 2, // Timer
+        1 << 3, // Serial
+        1 << 4, // Joypad
+    ];
+
     fn handle_interrupts(&mut self) {
         let (ie, iflag) = self.get_interrupt_registers();
         let pending = ie & iflag;
@@ -837,13 +849,20 @@ impl CPU {
         }
 
         for (idx, interrupt) in CPU::PRIORITY.iter().enumerate() {
-                        let mask = 1 << idx;
+            let mask = 1 << idx;
             let is_pending = pending & mask != 0;
             if is_pending {
-                if matches!(interrupt, Interrupt::Joypad){
-                println!("Servicing Joypad");
-            }
-
+                if matches!(interrupt, Interrupt::Timer) {
+                    continue
+                };
+                if matches!(interrupt, Interrupt::Joypad) {
+                    println!(
+                        "Servicing : {:?} IE : {} IF : {} Jumps to {:02X}",
+                        interrupt,
+                        self.read(IE),
+                        self.read(IF),
+                        *interrupt as u16); 
+                }
 
                 let new_iflag = iflag & !mask;
                 self.write(IF, new_iflag);
@@ -853,6 +872,46 @@ impl CPU {
                 break; //<- Only one interrupt per cycle/IME check
             }
         }
+    }
+    fn andle_interrupts(&mut self) {
+    let (ie, iflag) = self.get_interrupt_registers();
+    let pending = ie & iflag & 0x1F;
+
+    if pending == 0 || !self.ime {
+        return;
+    }
+
+    self.halted = false;
+
+    for (idx, interrupt) in CPU::PRIORITY.iter().enumerate() {
+        let mask = 1 << idx;
+        if (pending & mask) != 0 {
+            if *interrupt == Interrupt::Joypad {
+                println!(">>> JOYPAD INTERRUPT SERVICED! Jumping to 0x60");
+            }
+
+            // 1. Clear the requested interrupt flag
+            self.write(IF, iflag & !mask);
+
+            // 2. Disable IME
+            self.ime = false;
+            self.ime_pending = false;
+
+            // 3. Push CURRENT PC (the one that was about to execute)
+            let pc = self.registers.pc;
+            let sp = self.registers.sp.wrapping_sub(2);
+            self.write(sp, pc as u8);           // low byte first
+            self.write(sp + 1, (pc >> 8) as u8); // high byte
+            self.registers.sp = sp;
+
+            // 4. Jump to handler
+            self.registers.pc = *interrupt as u16;
+
+            println!("Jumping to {:04X}", *interrupt as u16);
+
+            break; // Only one interrupt per check
+        }
+    }
     }
 
     //Timer
