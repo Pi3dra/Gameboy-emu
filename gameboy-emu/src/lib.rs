@@ -80,6 +80,24 @@ impl RetroCore for RustBoiCore {
         self.gameboi = GameBoi::new();
     }
     fn run(&mut self, _env: &RetroEnvironment, runtime: &RetroRuntime) {
+        let mut pressed = 0xFF;
+
+        // Set bits for pressed buttons (bit = pressed)
+        if runtime.is_joypad_button_pressed(0, Right) || runtime.is_joypad_button_pressed(0, A) {
+            pressed &= !0x01;
+        }
+        if runtime.is_joypad_button_pressed(0, Left) || runtime.is_joypad_button_pressed(0, B) {
+            pressed &= !0x02;
+        }
+        if runtime.is_joypad_button_pressed(0, Up) || runtime.is_joypad_button_pressed(0, Select) {
+            pressed &= !0x04;
+        }
+        if runtime.is_joypad_button_pressed(0, Down) || runtime.is_joypad_button_pressed(0, Start) {
+            pressed &= !0x08;
+        }
+
+        self.gameboi.receive_input(pressed);
+
         // Run one full frame → you get [u8; 23040] of color indices (0-3)
         let raw_frame: [u8; WIDTH * HEIGHT] = self.gameboi.step();
 
@@ -96,37 +114,6 @@ impl RetroCore for RustBoiCore {
                 self.framebuffer.len() * std::mem::size_of::<u16>(),
             )
         };
-
-        let mut joypad_input = 0xCF;
-        if runtime.is_joypad_button_pressed(0, A) {
-            joypad_input &= !0x01;
-        }
-        if runtime.is_joypad_button_pressed(0, B) {
-            joypad_input &= !0x02;
-        }
-        if runtime.is_joypad_button_pressed(0, Select) {
-            joypad_input &= !0x04;
-        }
-        if runtime.is_joypad_button_pressed(0, Start) {
-            joypad_input &= !0x08;
-        }
-
-        if runtime.is_joypad_button_pressed(0, Up) {
-            joypad_input &= !0x01;
-        }
-        if runtime.is_joypad_button_pressed(0, Down) {
-            joypad_input &= !0x02;
-        }
-        if runtime.is_joypad_button_pressed(0, Left) {
-            joypad_input &= !0x04;
-        }
-        if runtime.is_joypad_button_pressed(0, Right) {
-            joypad_input &= !0x08;
-        }
-
-        if joypad_input != 0xCF {
-            self.gameboi.receive_input(joypad_input);
-        }
 
         // Now upload as raw bytes with correct pitch
         runtime.upload_video_frame(bytes, WIDTH as u32, HEIGHT as u32, WIDTH * 2);
